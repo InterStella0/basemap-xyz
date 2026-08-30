@@ -72,7 +72,7 @@ render finishes. The API handles that with:
 The site and tiles are then on `${EXPOSE_PORT}` (8080 by default).
 
 Database credentials never enter the project file or the image: the layers reference
-`service=darkbasemap`, and `qgis-server/entrypoint.sh` writes the matching `pg_service.conf` and
+`service=mellabasemap`, and `qgis-server/entrypoint.sh` writes the matching `pg_service.conf` and
 `.pgpass` at container start.
 
 ## Cache behaviour
