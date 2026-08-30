@@ -41,6 +41,25 @@ async fn run() {
     }
 
     let cache = Arc::new(TileCache::new(config.cache_dir.clone(), config.tile_ttl));
+
+    match &config.project_version {
+        Some(version) => match cache.sync_project_version(version).await {
+            Ok(true) => tracing::info!(version, "project.qgz version changed; tile cache flushed"),
+            Ok(false) => {
+                tracing::info!(version, "project.qgz version unchanged; tile cache retained")
+            }
+            // A half-wiped cache from an interrupted sync is worse than refusing to start, so this
+            // fails at boot rather than serving tiles under an unknown mix of old and new renders.
+            Err(err) => panic!(
+                "failed to sync project version marker in {}: {err}",
+                config.cache_dir.display()
+            ),
+        },
+        None => tracing::info!(
+            "PROJECT_VERSION not set; skipping version-based cache flush (TTL-only invalidation)"
+        ),
+    }
+
     let renderer = Arc::new(Renderer::new(
         config.renderer_url.clone(),
         config.render_concurrency,
@@ -127,6 +146,7 @@ mod route_tests {
             memory_capacity: 64,
             memory_ttl: Duration::from_secs(60),
             negative_ttl: Duration::from_secs(60),
+            project_version: None,
         });
         let metrics = Arc::new(Metrics::default());
         let cache = Arc::new(TileCache::new(dir, config.tile_ttl));

@@ -65,7 +65,9 @@ render finishes. The API handles that with:
 ## Setup
 
 1. **Add your project.** Drop `project.qgz` into `qgis-server/project/` — see the README there for
-   the two settings QGIS Desktop needs (publish the layer for WMTS, tick EPSG:3857).
+   the two settings QGIS Desktop needs (publish the layer for WMTS, tick EPSG:3857). Whenever you
+   replace it later, run `scripts/sync-project-version.sh` and then `docker compose up -d` — that
+   flushes the tile cache immediately instead of waiting out `TILE_TTL_DAYS`.
 2. **Configure.** `cp default.env .env` and fill in `BASEMAP_PUBLIC_URL` and the `DB_*` values.
 3. **Run.** `docker compose up -d --build`
 
@@ -84,7 +86,14 @@ directories that empties.
 **nginx does not check the TTL** — it serves whatever is on disk. So a tile can survive up to
 `TTL + sweep_interval`. That is intended for a basemap; it is not a bug.
 
-To force a full re-render after changing the cartography, empty the volume:
+If `PROJECT_VERSION` is set in `.env`, the API compares it against a marker it keeps at the root of
+the tile cache volume on every boot; a mismatch — including "no marker yet" — wipes the whole cache
+before serving anything. `scripts/sync-project-version.sh` sets `PROJECT_VERSION` to a hash of
+`qgis-server/project/project.qgz`, so updating the cartography is: replace the file, run the script,
+`docker compose up -d`. Only `api`'s config changed, so compose recreates just that container — no
+image rebuild needed. Leave `PROJECT_VERSION` empty to opt out and keep pure TTL-only behaviour.
+
+For a flush not tied to `project.qgz` (e.g. a database-only change), fall back to the manual flush:
 
 ```sh
 docker compose stop api reverse

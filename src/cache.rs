@@ -12,6 +12,11 @@ use crate::tiles::TileCoord;
 /// races an in-flight write cannot delete a temp file still being written.
 const TMP_GRACE: Duration = Duration::from_secs(3_600);
 
+/// Filename of the on-disk marker recording which `PROJECT_VERSION` last populated this cache.
+/// Lives at the cache root rather than under a `{layer}/{z}/{x}/` path, and matches neither the
+/// `.tmp` nor `.png` suffixes `sweep()` looks for, so the janitor walk always leaves it alone.
+const PROJECT_VERSION_MARKER: &str = ".project-version";
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SweepReport {
     pub files_live: u64,
@@ -84,6 +89,35 @@ impl TileCache {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Wipes the whole cache when `version` doesn't match what's recorded on disk (including
+    /// "nothing recorded yet"). This is the TTL's counterpart for a change the TTL cannot see: once
+    /// project.qgz's cartography changes, every existing tile is wrong *now*, not just old. Returns
+    /// whether it wiped.
+    pub async fn sync_project_version(&self, version: &str) -> io::Result<bool> {
+        tokio::fs::create_dir_all(&self.root).await?;
+        let marker = self.root.join(PROJECT_VERSION_MARKER);
+
+        // Any read failure (missing file, or something stranger) is treated the same as "no
+        // marker yet": being unable to prove the versions match is reason enough to invalidate.
+        let previous = tokio::fs::read_to_string(&marker).await.ok();
+        if previous.as_deref() == Some(version) {
+            return Ok(false);
+        }
+
+        let mut entries = tokio::fs::read_dir(&self.root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if entry.file_type().await?.is_dir() {
+                tokio::fs::remove_dir_all(&path).await?;
+            } else {
+                tokio::fs::remove_file(&path).await?;
+            }
+        }
+
+        tokio::fs::write(&marker, version).await?;
+        Ok(true)
     }
 
     /// Walks the whole cache: unlinks tiles past the TTL and orphaned temp files, prunes the
@@ -288,6 +322,75 @@ mod tests {
         let report = cache.sweep().await.unwrap();
         assert_eq!(report.files_live, 0);
         assert_eq!(report.files_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn sync_project_version_wipes_on_first_run_and_writes_the_marker() {
+        let root = temp_root("version-first-run");
+        let cache = TileCache::new(root.clone(), Duration::from_secs(120 * 86_400));
+        let coord = TileCoord::new("countries", 5, 1, 1);
+        cache.store(&coord, &Bytes::from_static(b"old")).await.unwrap();
+
+        let flushed = cache.sync_project_version("v1").await.unwrap();
+        assert!(flushed, "no marker yet must count as a mismatch");
+        assert!(!coord.cache_path(&root).exists(), "pre-existing tiles must be wiped");
+        assert_eq!(std::fs::read_to_string(root.join(".project-version")).unwrap(), "v1");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_project_version_is_a_no_op_when_unchanged() {
+        let root = temp_root("version-unchanged");
+        let cache = TileCache::new(root.clone(), Duration::from_secs(120 * 86_400));
+        cache.sync_project_version("v1").await.unwrap();
+
+        let coord = TileCoord::new("countries", 5, 2, 2);
+        cache.store(&coord, &Bytes::from_static(b"fresh")).await.unwrap();
+
+        let flushed = cache.sync_project_version("v1").await.unwrap();
+        assert!(!flushed, "an unchanged version must not wipe anything");
+        assert!(coord.cache_path(&root).exists(), "tiles must survive a matching sync");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_project_version_wipes_on_mismatch() {
+        let root = temp_root("version-mismatch");
+        let cache = TileCache::new(root.clone(), Duration::from_secs(120 * 86_400));
+        cache.sync_project_version("v1").await.unwrap();
+
+        let coord = TileCoord::new("countries", 5, 3, 3);
+        cache.store(&coord, &Bytes::from_static(b"old cartography")).await.unwrap();
+
+        let flushed = cache.sync_project_version("v2").await.unwrap();
+        assert!(flushed, "a changed version must wipe the cache");
+        assert!(!coord.cache_path(&root).exists());
+        assert_eq!(std::fs::read_to_string(root.join(".project-version")).unwrap(), "v2");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_project_version_marker_is_never_swept() {
+        let root = temp_root("version-vs-sweep");
+        let ttl = Duration::from_secs(120 * 86_400);
+        let cache = TileCache::new(root.clone(), ttl);
+        cache.sync_project_version("v1").await.unwrap();
+
+        let coord = TileCoord::new("countries", 5, 4, 4);
+        cache.store(&coord, &Bytes::from_static(b"stale")).await.unwrap();
+        age_file(&coord.cache_path(&root), ttl + Duration::from_secs(86_400));
+
+        cache.sweep().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join(".project-version")).unwrap(),
+            "v1",
+            "the janitor must never treat the marker as a stale or orphaned file"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

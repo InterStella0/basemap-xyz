@@ -38,6 +38,12 @@ pub struct Config {
     pub memory_capacity: u64,
     pub memory_ttl: Duration,
     pub negative_ttl: Duration,
+    /// Opaque operator-supplied tag (by convention a hash of project.qgz, written by
+    /// `scripts/sync-project-version.sh`) that the cache compares against a marker on disk at boot.
+    /// A mismatch means the cartography changed, so the whole cache is wiped rather than waiting
+    /// out `tile_ttl`. `None` (unset or empty) means "not tracking this" — pure TTL behaviour,
+    /// unchanged from today.
+    pub project_version: Option<String>,
 }
 
 impl Config {
@@ -73,6 +79,12 @@ impl Config {
             memory_capacity: get_env_default("TILE_MEMORY_CAPACITY", 4096),
             memory_ttl: Duration::from_secs(get_env_default("TILE_MEMORY_TTL_SECS", 600)),
             negative_ttl: Duration::from_secs(get_env_default("TILE_NEGATIVE_TTL_SECS", 60)),
+            // Any non-empty string is valid here, so `get_env_default` (which panics on an
+            // unparseable value) doesn't fit — this is parsed by hand instead.
+            project_version: env::var("PROJECT_VERSION")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
         }
     }
 }

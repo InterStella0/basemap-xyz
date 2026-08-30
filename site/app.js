@@ -3,7 +3,7 @@
 
   const TILE_URL = '${BASEMAP_PUBLIC_URL}/tiles/countries/{z}/{x}/{y}.png';
   const ATTRIBUTION =
-    '&copy; <a href="https://queeniemella.cc">queeniemella.cc</a> | ' +
+    '&copy; <a href="https://queeniemella.cc">queeniemella</a> | ' +
     '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
   document.querySelectorAll('.copy').forEach(function (button) {
