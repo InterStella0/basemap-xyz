@@ -1,0 +1,6 @@
+/target
+.env
+
+
+# RustRover / IntelliJ
+/.idea/

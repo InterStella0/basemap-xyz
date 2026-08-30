@@ -1,0 +1,17 @@
+**/.DS_Store
+**/.dockerignore
+**/.env
+**/.git
+**/.gitignore
+**/.idea
+**/.vscode
+**/docker-compose*
+**/compose.y*ml
+/target
+LICENSE
+README.md
+.claude
+CLAUDE.md
+# The renderer image has its own context and its own .dockerignore; the project file must never
+# reach the API or proxy build.
+qgis-server

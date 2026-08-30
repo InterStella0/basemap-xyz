@@ -1,0 +1,29 @@
+[package]
+name = "dark-basemap-xyz"
+version = "0.1.0"
+edition = "2024"
+description = "XYZ tile cache in front of QGIS Server, serving a free dark basemap"
+license = "MIT"
+repository = "https://github.com/InterStella0/basemap-xyz"
+
+[dependencies]
+poem = { version = "3.1.12" }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "fs", "signal", "sync", "time", "macros"] }
+# No TLS: the renderer is an in-network HTTP service reached over plain http://. Enabling rustls
+# drags in aws-lc-sys (a C build needing cmake) for no benefit, and native-tls would need the
+# vendored-openssl dance zegraph-web carries. Put a proxy in front if you ever need https here.
+reqwest = { version = "0.13.4", default-features = false, features = ["http2", "query"] }
+moka = { version = "0.12.15", features = ["future"] }
+bytes = "1.10.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+dotenv = "0.15.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.17"
+
+[dev-dependencies]
+poem = { version = "3.1.12", features = ["test"] }
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }
+# Backdating mtimes is the only way to test the 120-day TTL and the janitor sweep without waiting.
+filetime = "0.2.28"

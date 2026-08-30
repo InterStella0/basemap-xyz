@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mella basemap — a free XYZ basemap</title>
+<meta name="description" content="A free, no-API-key dark basemap. OpenStreetMap data with custom QGIS symbology, served as plain XYZ tiles for QGIS, Leaflet, MapLibre, OpenLayers and ArcGIS.">
+<meta property="og:title" content="mella basemap">
+<meta property="og:description" content="A free, no-API-key basemap. Plain XYZ tiles, works everywhere.">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#080a0e">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<a class="skip" href="#why">Skip to content</a>
+
+<header class="hero">
+  <div class="hero-map" id="map" aria-hidden="true"></div>
+  <div class="hero-scrim" aria-hidden="true"></div>
+
+  <nav class="nav">
+    <span class="brand"><span class="brand-dot"></span> mella basemap</span>
+    <div class="nav-links">
+      <a href="#why">Why</a>
+      <a href="#use">How to use</a>
+      <a href="#attribution">Attribution</a>
+      <a href="#fair-use">Fair use</a>
+    </div>
+  </nav>
+
+  <div class="hero-inner">
+    <p class="eyebrow">Free · No API key · No signup</p>
+    <h1>A dark basemap<br>that doesn't ask for anything.</h1>
+    <p class="lede">
+      OpenStreetMap, rendered with my own cartography in QGIS and served as plain XYZ tiles.
+      Paste one URL into whatever you already use.
+    </p>
+
+    <div class="urlbox">
+      <code id="tile-url">${BASEMAP_PUBLIC_URL}/tiles/countries/{z}/{x}/{y}.png</code>
+      <button class="copy" data-copy-target="tile-url" aria-label="Copy tile URL">Copy</button>
+    </div>
+
+    <ul class="badges">
+      <li>Zoom 0–20</li>
+      <li>256 px PNG</li>
+      <li>EPSG:4326</li>
+    </ul>
+  </div>
+
+</header>
+
+<main>
+
+<section id="why" class="section">
+  <p class="kicker">Why</p>
+  <h2>Because every other one wanted a card on file.</h2>
+  <div class="prose">
+    <p>
+      I needed a dark basemap for my own projects. Everything decent was behind an API key, a signup,
+      a monthly quota, or a billing page — and most of the free alternatives look like someone
+      inverted a light basemap and called it a night.
+    </p>
+    <p>
+      So I made one. It's OpenStreetMap data in PostGIS, styled by hand in QGIS Desktop, rendered by
+      QGIS Server, and cached as ordinary XYZ tiles. The cache does almost all the work, which means
+      leaving it open to everyone costs me very little. So it's open to everyone.
+    </p>
+    <p class="strong">
+      No key. No signup. No tracking. No quota page. Just a URL.
+    </p>
+    <p>
+      The whole thing is open source under the
+      <a href="https://github.com/InterStella0/basemap-xyz/blob/HEAD/LICENSE">MIT licence</a> —
+      the tile cache, the QGIS Server setup and this page are all on
+      <a href="https://github.com/InterStella0/basemap-xyz">GitHub</a>. If you would rather not
+      depend on me staying online, run your own copy.
+    </p>
+  </div>
+</section>
+
+<section id="use" class="section">
+  <p class="kicker">How to use</p>
+  <h2>Pick your tool.</h2>
+  <p class="section-lede">Every snippet already includes the attribution you're required to display.</p>
+
+  <div class="tabs">
+    <div class="tablist" role="tablist" aria-label="Client examples">
+      <button role="tab" id="tab-qgis" aria-controls="panel-qgis" aria-selected="true">QGIS</button>
+      <button role="tab" id="tab-leaflet" aria-controls="panel-leaflet" aria-selected="false">Leaflet</button>
+      <button role="tab" id="tab-maplibre" aria-controls="panel-maplibre" aria-selected="false">MapLibre</button>
+      <button role="tab" id="tab-openlayers" aria-controls="panel-openlayers" aria-selected="false">OpenLayers</button>
+      <button role="tab" id="tab-arcgis" aria-controls="panel-arcgis" aria-selected="false">ArcGIS</button>
+      <button role="tab" id="tab-raw" aria-controls="panel-raw" aria-selected="false">Raw URL</button>
+    </div>
+
+    <div role="tabpanel" id="panel-qgis" aria-labelledby="tab-qgis">
+      <ol class="steps">
+        <li>Open the <strong>Browser</strong> panel.</li>
+        <li>Right-click <strong>XYZ Tiles</strong> → <strong>New Connection…</strong></li>
+        <li>Name it <em>mella basemap</em> and paste the URL below.</li>
+        <li>Set <strong>Max. Zoom Level</strong> to <strong>20</strong>, then <strong>OK</strong>.</li>
+        <li>Double-click the new entry to add it to your project.</li>
+      </ol>
+      <div class="code">
+        <button class="copy" data-copy-target="code-qgis" aria-label="Copy QGIS URL">Copy</button>
+        <pre><code id="code-qgis">${BASEMAP_PUBLIC_URL}/tiles/countries/{z}/{x}/{y}.png</code></pre>
+      </div>
+      <p class="note">Set the attribution (queeniemella.cc + OpenStreetMap) under
+      <strong>Layer Properties → QGIS Server → Attribution</strong>, or in the layer metadata, so it
+      travels with anything you export.</p>
+    </div>
+
+    <div role="tabpanel" id="panel-leaflet" aria-labelledby="tab-leaflet" hidden>
+      <div class="code">
+        <button class="copy" data-copy-target="code-leaflet" aria-label="Copy Leaflet snippet">Copy</button>
+        <pre><code id="code-leaflet">const map = L.map('map').setView([48.85, 2.35], 12);
+
+L.tileLayer('${BASEMAP_PUBLIC_URL}/tiles/countries/{z}/{x}/{y}.png', {
+  maxZoom: 20,
+  attribution: '&copy; &lt;a href="https://queeniemella.cc"&gt;queeniemella.cc&lt;/a&gt; | &copy; &lt;a href="https://www.openstreetmap.org/copyright"&gt;OpenStreetMap&lt;/a&gt; contributors'
+}).addTo(map);</code></pre>
+      </div>
+      <p class="note">This is exactly what powers the map at the top of this page.</p>
+    </div>
+
+    <div role="tabpanel" id="panel-maplibre" aria-labelledby="tab-maplibre" hidden>
+      <div class="code">
+        <button class="copy" data-copy-target="code-maplibre" aria-label="Copy MapLibre snippet">Copy</button>
+        <pre><code id="code-maplibre">const map = new maplibregl.Map({
+  container: 'map',
+  center: [2.35, 48.85],
+  zoom: 12,
+  style: {
+    version: 8,
+    sources: {
+      dark: {
+        type: 'raster',
+        tiles: ['${BASEMAP_PUBLIC_URL}/tiles/countries/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        maxzoom: 20,
+        attribution: '&copy; &lt;a href="https://queeniemella.cc"&gt;queeniemella.cc&lt;/a&gt; | &copy; &lt;a href="https://www.openstreetmap.org/copyright"&gt;OpenStreetMap&lt;/a&gt; contributors'
+      }
+    },
+    layers: [{ id: 'dark', type: 'raster', source: 'dark' }]
+  }
+});</code></pre>
+      </div>
+    </div>
+
+    <div role="tabpanel" id="panel-openlayers" aria-labelledby="tab-openlayers" hidden>
+      <div class="code">
+        <button class="copy" data-copy-target="code-openlayers" aria-label="Copy OpenLayers snippet">Copy</button>
+        <pre><code id="code-openlayers">import Map from 'ol/Map.js';
+import View from 'ol/View.js';
+import TileLayer from 'ol/layer/Tile.js';
+import XYZ from 'ol/source/XYZ.js';
+import { fromLonLat } from 'ol/proj.js';
+
+new Map({
+  target: 'map',
+  view: new View({ center: fromLonLat([2.35, 48.85]), zoom: 12 }),
+  layers: [
+    new TileLayer({
+      source: new XYZ({
+        url: '${BASEMAP_PUBLIC_URL}/tiles/countries/{z}/{x}/{y}.png',
+        maxZoom: 20,
+        attributions: '&copy; &lt;a href="https://queeniemella.cc"&gt;queeniemella.cc&lt;/a&gt; | &copy; &lt;a href="https://www.openstreetmap.org/copyright"&gt;OpenStreetMap&lt;/a&gt; contributors'
+      })
+    })
+  ]
+});</code></pre>
+      </div>
+    </div>
+
+    <div role="tabpanel" id="panel-arcgis" aria-labelledby="tab-arcgis" hidden>
+      <ol class="steps">
+        <li>ArcGIS Pro 2.6 or newer.</li>
+        <li><strong>Map</strong> tab → <strong>Add Data</strong> → <strong>Data From Path</strong>.</li>
+        <li>Paste the URL below, leave <strong>Service Type</strong> on <strong>Automatic</strong>.</li>
+        <li><strong>Add</strong>, then drag the layer into your basemap group.</li>
+      </ol>
+      <div class="code">
+        <button class="copy" data-copy-target="code-arcgis" aria-label="Copy ArcGIS URL">Copy</button>
+        <pre><code id="code-arcgis">${BASEMAP_PUBLIC_URL}/tiles/countries/{z}/{x}/{y}.png</code></pre>
+      </div>
+      <p class="note">The same template works in ArcGIS Online under <strong>Add → Add layer from URL</strong>
+      with the type set to a tile layer. Add the queeniemella.cc and OpenStreetMap credit in the
+      layer's properties.</p>
+    </div>
+
+    <div role="tabpanel" id="panel-raw" aria-labelledby="tab-raw" hidden>
+      <div class="code">
+        <button class="copy" data-copy-target="code-raw" aria-label="Copy raw URL">Copy</button>
+        <pre><code id="code-raw">${BASEMAP_PUBLIC_URL}/tiles/countries/{z}/{x}/{y}.png</code></pre>
+      </div>
+      <dl class="spec">
+        <div><dt>Scheme</dt><dd>XYZ / slippy map, <code>y</code> counted from the top</dd></div>
+        <div><dt>Projection</dt><dd>EPSG:3857 (Web Mercator)</dd></div>
+        <div><dt>Zoom</dt><dd>0 – 20</dd></div>
+        <div><dt>Tile size</dt><dd>256 × 256 PNG</dd></div>
+        <div><dt>CORS</dt><dd><code>Access-Control-Allow-Origin: *</code></dd></div>
+        <div><dt>Caching</dt><dd><code>Cache-Control: public, max-age=604800</code></dd></div>
+      </dl>
+      <p class="note">Out-of-range coordinates answer <code>404</code>. If every renderer is busy you'll
+      get a <code>503</code> with a <code>Retry-After</code> header — back off and try again rather than
+      hammering it.</p>
+    </div>
+  </div>
+</section>
+
+<section id="attribution" class="section">
+  <p class="kicker">Attribution</p>
+  <h2>You do have to credit OpenStreetMap.</h2>
+  <div class="prose">
+    <p>
+      The cartography is <a href="https://queeniemella.cc">queeniemella.cc</a>'s, but the geometry
+      underneath is the OpenStreetMap database, which is licensed
+      <a href="https://opendatacommons.org/licenses/odbl/">ODbL</a>. Rendered tiles count as a
+      "Produced Work", and that licence requires the credit to be visible wherever the map is. Styling
+      it differently doesn't change what the data is.
+    </p>
+    <p>It's one line. Drop it anywhere the map is visible:</p>
+  </div>
+  <div class="code">
+    <button class="copy" data-copy-target="code-attr" aria-label="Copy attribution HTML">Copy</button>
+    <pre><code id="code-attr">&copy; &lt;a href="https://queeniemella.cc"&gt;queeniemella.cc&lt;/a&gt; | &copy; &lt;a href="https://www.openstreetmap.org/copyright"&gt;OpenStreetMap&lt;/a&gt; contributors</code></pre>
+  </div>
+  <p class="note">Most libraries render this for you if you pass it as the layer's
+  <code>attribution</code> — every snippet above already does.</p>
+</section>
+
+<section id="fair-use" class="section">
+  <p class="kicker">Fair use</p>
+  <h2>There's no key, so please don't make me add one.</h2>
+  <div class="cards">
+    <div class="card">
+      <h3>Fine</h3>
+      <p>Personal projects, side projects, client work, internal dashboards, prototypes, teaching,
+      research, commercial use. Genuinely — go ahead.</p>
+    </div>
+    <div class="card">
+      <h3>Not fine</h3>
+      <p>Bulk-scraping the pyramid to build your own offline copy, or pointing a render farm at it.
+      That's the one thing that would actually cost me money.</p>
+    </div>
+    <div class="card">
+      <h3>If you need volume</h3>
+      <p>Get in touch before you start. It's easier to help you than to notice the traffic and start
+      blocking things.</p>
+    </div>
+  </div>
+  <p class="note">
+    No uptime guarantee and no support contract; this is a thing I host, not a product I sell. If you want one,
+    host it yourself, its open source.
+  </p>
+</section>
+
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <div>
+      <p class="brand"><span class="brand-dot"></span> mella basemap</p>
+      <p class="muted">Map data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>
+      contributors, <a href="https://opendatacommons.org/licenses/odbl/">ODbL</a>. Cartography and
+      hosting by <a href="https://queeniemella.cc">queeniemella.cc</a>.</p>
+    </div>
+    <div class="footer-meta">
+      <a href="https://github.com/InterStella0/basemap-xyz">Source on GitHub</a>
+      <span class="muted">Code
+        <a href="https://github.com/InterStella0/basemap-xyz/blob/HEAD/LICENSE">MIT</a>
+        &middot; map data ODbL &mdash; they are separate licences</span>
+      <span class="muted">Rendered with QGIS Server &middot; cached in Rust</span>
+    </div>
+  </div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

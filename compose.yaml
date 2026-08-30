@@ -1,0 +1,127 @@
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # Public entrypoint. Serves the site, answers cache hits straight off the tile volume, and only
+  # forwards a miss to the API.
+  reverse:
+    image: interstella0/dark-basemap:reverse
+    restart: always
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    environment:
+      API_HOST: ${API_HOST:-api}
+      BASEMAP_PUBLIC_URL: ${BASEMAP_PUBLIC_URL:-http://localhost:8080}
+      # Space-separated CIDRs whose X-Forwarded-For may be believed. Leave empty unless something
+      # actually sits in front of this.
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
+    volumes:
+      # Read-only: nginx serves from this volume but never writes to it. The API is the only writer.
+      - tile_cache:/var/cache/tiles:ro
+    ports:
+      - "${EXPOSE_PORT:-8080}:80"
+    networks:
+      - default
+    logging: *default-logging
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 64M
+
+  # The XYZ cache. Only ever sees misses in the deployed setup: render once, store, hand back.
+  api:
+    image: interstella0/dark-basemap:api
+    restart: always
+    build:
+      context: .
+      target: final
+    env_file:
+      - .env
+    environment:
+      RENDERER_URL: http://renderer
+      TILE_CACHE_DIR: /var/cache/tiles
+    volumes:
+      - tile_cache:/var/cache/tiles:rw
+    networks:
+      - default
+    logging: *default-logging
+    healthcheck:
+      # /health/live, not /health: the latter probes QGIS, and a 10s poll would hold one of the
+      # renderer's few FCGI slots permanently. Liveness is what the orchestrator can actually act
+      # on; the renderer's state is reported by /health for humans.
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # QGIS Server. The slow, expensive part — everything above exists to call it as rarely as
+  # possible. Postgres lives outside compose; DB_HOST points at it.
+  renderer:
+    image: interstella0/dark-basemap:renderer
+    restart: always
+    build:
+      context: ./qgis-server
+      args:
+        QGIS_VERSION: ${QGIS_VERSION:-4.2.1}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      LANG: en_EN.UTF-8
+      QGIS_PROJECT_FILE: /home/qgis/project/project.qgz
+      QGIS_SERVER_LOG_LEVEL: ${QGIS_SERVER_LOG_LEVEL:-1}
+      QGIS_SERVER_PARALLEL_RENDERING: "1"
+      QGIS_SERVER_MAX_THREADS: "4"
+      # Skips re-reading extent and geometry type from every PostGIS layer on project load. By far
+      # the biggest cold-start win for a database-backed project; safe as long as the .qgz is
+      # rebuilt when the schema changes.
+      QGIS_SERVER_TRUST_LAYER_METADATA: "1"
+      QGIS_SERVER_IGNORE_BAD_LAYERS: "0"
+      QGIS_SERVER_CACHE_SIZE: "100"
+      # The API's RENDER_CONCURRENCY should stay at or below this; queueing beyond it just moves
+      # the backlog inside QGIS where we cannot time it out.
+      FCGID_MAX_PROCESSES: ${FCGID_MAX_PROCESSES:-5}
+      FCGID_MIN_PROCESSES: "2"
+      # Must equal the `service=` name inside project.qgz.
+      PG_SERVICE_NAME: ${PG_SERVICE_NAME:-mellabasemap}
+      DB_NAME: ${DB_NAME}
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+    networks:
+      - default
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  tile_cache:
+
+networks:
+  default:

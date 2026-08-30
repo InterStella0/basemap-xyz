@@ -1,0 +1,325 @@
+:root {
+  --bg: #080a0e;
+  --surface: #10141b;
+  --surface-2: #161c26;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --text: #e8ecf3;
+  --muted: #8b94a7;
+  --accent: #7cc4ff;
+  --accent-soft: rgba(124, 196, 255, 0.12);
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --max: 1080px;
+  --radius: 14px;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { animation: none !important; transition: none !important; }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Poppins, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-weight: 300;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.skip {
+  position: absolute; left: -9999px; top: 0; z-index: 100;
+  background: var(--accent); color: #04070c; padding: 10px 16px; border-radius: 0 0 8px 0;
+}
+.skip:focus { left: 0; }
+
+/* ---- hero ---------------------------------------------------------------------------------- */
+.hero {
+  position: relative;
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+}
+
+/* The live map is the hero background: the product demonstrates itself before a word is read.
+   Leaflet stamps .leaflet-container onto this same element and that class ships a light grey
+   background, so the colour is restated at a specificity that beats it. */
+.hero-map { position: absolute; inset: 0; background: var(--bg); }
+.hero-map.leaflet-container { background: var(--bg); }
+
+.hero-scrim {
+  position: absolute; inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(180deg, rgba(8,10,14,0.92) 0%, rgba(8,10,14,0.55) 28%, rgba(8,10,14,0.30) 52%, rgba(8,10,14,0.95) 100%),
+    radial-gradient(120% 80% at 12% 40%, rgba(8,10,14,0.85) 0%, rgba(8,10,14,0) 70%);
+}
+
+.nav {
+  position: relative; z-index: 3;
+  display: flex; align-items: center; justify-content: space-between; gap: 24px; flex-wrap: wrap;
+  width: 100%; max-width: var(--max); margin: 0 auto; padding: 26px 24px;
+}
+.brand {
+  display: inline-flex; align-items: center; gap: 10px;
+  font-weight: 500; font-size: 0.98rem; letter-spacing: -0.01em; margin: 0;
+}
+.brand-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}
+.nav-links { display: flex; gap: 26px; flex-wrap: wrap; }
+.nav-links a { color: var(--muted); font-size: 0.9rem; }
+.nav-links a:hover { color: var(--text); text-decoration: none; }
+
+.hero-inner {
+  position: relative; z-index: 3;
+  width: 100%; max-width: var(--max); margin: 0 auto;
+  padding: 40px 24px 24px;
+  display: flex; flex-direction: column; justify-content: center; flex: 1;
+}
+
+.eyebrow {
+  margin: 0 0 20px;
+  font-size: 0.78rem; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--accent);
+}
+
+h1 {
+  margin: 0 0 22px;
+  font-size: clamp(2.3rem, 6.2vw, 4.1rem);
+  font-weight: 600; line-height: 1.08; letter-spacing: -0.035em;
+}
+
+.lede {
+  margin: 0 0 34px; max-width: 46ch;
+  font-size: clamp(1.02rem, 1.5vw, 1.16rem); color: #c3cbd9;
+}
+
+.urlbox {
+  display: flex; align-items: stretch; gap: 0;
+  max-width: 620px;
+  background: rgba(10, 13, 19, 0.82);
+  backdrop-filter: blur(14px);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.urlbox code {
+  flex: 1; min-width: 0;
+  padding: 16px 18px;
+  font-family: var(--mono); font-size: 0.86rem; color: var(--text);
+  overflow-x: auto; white-space: nowrap;
+}
+.urlbox .copy { border-radius: 0; border: 0; border-left: 1px solid var(--line-strong); padding: 0 22px; }
+
+.badges {
+  display: flex; flex-wrap: wrap; gap: 10px;
+  list-style: none; margin: 24px 0 0; padding: 0;
+}
+.badges li {
+  font-size: 0.78rem; color: var(--muted);
+  padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px;
+  background: rgba(10, 13, 19, 0.6);
+}
+
+.hero-hint {
+  position: relative; z-index: 3;
+  margin: 0; padding: 0 24px 28px;
+  width: 100%; max-width: var(--max); margin-inline: auto;
+  font-size: 0.76rem; color: var(--muted); letter-spacing: 0.04em;
+}
+
+/* ---- sections ------------------------------------------------------------------------------ */
+.section {
+  max-width: var(--max);
+  margin: 0 auto;
+  padding: 96px 24px;
+  border-bottom: 1px solid var(--line);
+}
+
+.kicker {
+  margin: 0 0 14px;
+  font-size: 0.74rem; font-weight: 500; letter-spacing: 0.16em; text-transform: uppercase;
+  color: var(--accent);
+}
+
+h2 {
+  margin: 0 0 28px; max-width: 20ch;
+  font-size: clamp(1.7rem, 3.4vw, 2.45rem);
+  font-weight: 500; line-height: 1.18; letter-spacing: -0.028em;
+}
+
+h3 {
+  margin: 0 0 10px;
+  font-size: 1rem; font-weight: 500; letter-spacing: -0.01em;
+}
+
+.prose { max-width: 62ch; }
+.prose p { margin: 0 0 18px; color: #c0c8d6; }
+.prose .strong { color: var(--text); font-weight: 400; }
+
+.section-lede { margin: -14px 0 32px; max-width: 60ch; color: var(--muted); font-size: 0.95rem; }
+
+.cards {
+  display: grid; gap: 16px; margin-top: 40px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+.card {
+  padding: 26px 24px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.card p { margin: 0; font-size: 0.9rem; color: var(--muted); }
+
+/* ---- tabs ---------------------------------------------------------------------------------- */
+.tablist {
+  display: flex; gap: 4px; flex-wrap: wrap;
+  padding: 5px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  width: fit-content; max-width: 100%;
+  margin-bottom: 28px;
+}
+.tablist button {
+  appearance: none; border: 0; cursor: pointer;
+  padding: 9px 18px; border-radius: 999px;
+  background: transparent; color: var(--muted);
+  font-family: inherit; font-size: 0.86rem; font-weight: 400;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.tablist button:hover { color: var(--text); }
+.tablist button[aria-selected="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 500; }
+.tablist button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.steps { margin: 0 0 24px; padding-left: 20px; max-width: 60ch; color: #c0c8d6; font-size: 0.93rem; }
+.steps li { margin-bottom: 8px; }
+.steps strong, .prose strong { font-weight: 500; color: var(--text); }
+
+/* ---- code ---------------------------------------------------------------------------------- */
+.code {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.code pre {
+  margin: 0; padding: 22px 24px;
+  /* Wide snippets scroll inside their own box; the page itself must never scroll sideways. */
+  overflow-x: auto;
+}
+.code code {
+  font-family: var(--mono); font-size: 0.83rem; line-height: 1.75; color: #cfd8e6;
+  white-space: pre;
+}
+.code .copy { position: absolute; top: 10px; right: 10px; }
+
+.copy {
+  appearance: none; cursor: pointer;
+  padding: 7px 14px; border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2); color: var(--muted);
+  font-family: inherit; font-size: 0.78rem; font-weight: 400;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.copy:hover { color: var(--text); border-color: var(--accent); }
+.copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.copy[data-copied="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+.note {
+  margin: 18px 0 0; max-width: 66ch;
+  font-size: 0.85rem; color: var(--muted);
+}
+.note code, .spec code { font-family: var(--mono); font-size: 0.85em; color: #cfd8e6; }
+
+.spec {
+  margin: 24px 0 0; display: grid; gap: 0;
+  border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+}
+.spec > div {
+  display: grid; grid-template-columns: 160px 1fr; gap: 16px;
+  padding: 13px 22px; border-bottom: 1px solid var(--line);
+  font-size: 0.87rem;
+}
+.spec > div:last-child { border-bottom: 0; }
+.spec dt { color: var(--muted); }
+.spec dd { margin: 0; color: var(--text); }
+
+/* ---- footer -------------------------------------------------------------------------------- */
+.footer { padding: 56px 24px 72px; }
+.footer-inner {
+  max-width: var(--max); margin: 0 auto;
+  display: flex; justify-content: space-between; gap: 32px; flex-wrap: wrap;
+}
+.footer p { margin: 0 0 8px; }
+.footer .muted { color: var(--muted); font-size: 0.84rem; max-width: 46ch; }
+.footer-meta { display: flex; flex-direction: column; gap: 8px; font-size: 0.84rem; }
+.footer-meta .muted { color: var(--muted); }
+
+/* Leaflet ships light-themed controls, which read as a bright box pasted onto a dark page.
+   Restyled here rather than hidden, because the attribution control is required to stay visible. */
+
+/* .hero-map sits under the scrim and the headline, but creates no stacking context of its own, so
+   Leaflet's pane z-indexes (200-700) and control corners (1000) would otherwise paint straight over
+   them. Containing the panes and pinning the corners to 4 restores the intended layering. */
+.hero-map .leaflet-map-pane { z-index: 0; }
+.hero-map .leaflet-top,
+.hero-map .leaflet-bottom { z-index: 4; }
+
+.leaflet-control-attribution {
+  background: rgba(10, 13, 19, 0.85) !important;
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 10px !important;
+  font-family: inherit !important;
+  font-size: 10px !important;
+  color: var(--muted) !important;
+}
+.leaflet-control-attribution a { color: var(--muted) !important; }
+.leaflet-control-attribution a:hover { color: var(--text) !important; }
+
+.leaflet-control-zoom {
+  background: rgba(10, 13, 19, 0.85) !important;
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--line) !important;
+  border-radius: 10px !important;
+  box-shadow: none !important;
+  overflow: hidden;
+}
+/* Leaflet's zoom buttons are anchors with real +/- text, not icons, so they take a colour directly
+   rather than the filter trick a sprite would need. */
+.leaflet-control-zoom a {
+  background: transparent !important;
+  border: 0 !important;
+  color: var(--muted) !important;
+  font-family: inherit;
+}
+.leaflet-control-zoom a + a { border-top: 1px solid var(--line) !important; }
+.leaflet-control-zoom a:hover {
+  background: rgba(255, 255, 255, 0.06) !important;
+  color: var(--text) !important;
+}
+.leaflet-control-zoom a.leaflet-disabled { color: var(--line) !important; }
+
+@media (max-width: 640px) {
+  .section { padding: 68px 20px; }
+  .nav { padding: 20px; }
+  .nav-links { gap: 16px; }
+  .hero-inner { padding: 24px 20px; }
+  .spec > div { grid-template-columns: 1fr; gap: 2px; }
+  .urlbox { flex-direction: column; }
+  .urlbox .copy { border-left: 0; border-top: 1px solid var(--line-strong); padding: 12px; }
+}
