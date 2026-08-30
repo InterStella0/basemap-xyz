@@ -3,11 +3,15 @@
 A free, no-API-key dark basemap. OpenStreetMap data with custom QGIS symbology, rendered by QGIS
 Server and served as plain XYZ tiles.
 
-Source: <https://github.com/InterStella0/basemap-xyz>
+```
+https://basemap.queeniemella.cc/tiles/{layer}/{z}/{x}/{y}.png
+```
 
+e.g for layer "countries"
 ```
-https://<your-domain>/tiles/{layer}/{z}/{x}/{y}.png
+https://basemap.queeniemella.cc/tiles/countries/{z}/{x}/{y}.png
 ```
+
 
 ## How it fits together
 
@@ -31,7 +35,6 @@ Three containers:
 | `api` | The Rust/Poem tile cache. Renders a missing tile once, stores it, hands it back. |
 | `renderer` | QGIS Server. The slow, expensive part; everything else exists to call it rarely. |
 
-Postgres is **not** in compose — point `DB_HOST` at wherever your PostGIS lives.
 
 ### Why nginx serves the hits
 
@@ -117,9 +120,9 @@ docker build --target test .   # runs the suite inside the image build (CI gate)
 The route tests point the renderer at a closed port, so anything that returns `502` provably passed
 validation and anything that returns `404` provably did not reach the renderer.
 
-## Licences
+## Licenses
 
-Two different things, two different licences — do not conflate them:
+Two different things, two different licenses:
 
 - **This code** (the tile cache, the QGIS Server setup, the site) is [MIT](LICENSE). Fork it, run
   your own, do what you like.
@@ -134,6 +137,7 @@ The cartography is mine; the geometry is OpenStreetMap, licensed
 credit has to be visible wherever the map is
 
 ```html
+&copy; <a href="https://basemap.queeniemella.cc">queeniemella</a>
 &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors
 ```
 
