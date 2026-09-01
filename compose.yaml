@@ -45,6 +45,9 @@ services:
   api:
     image: interstella0/dark-basemap:api
     restart: always
+    # The API drains accepted tile renders for up to 70s after SIGTERM. Keep Docker's deadline
+    # longer so it does not sever those upstream connections with SIGKILL during a deployment.
+    stop_grace_period: 75s
     build:
       context: .
       target: final

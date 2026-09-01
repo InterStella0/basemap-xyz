@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use poem::listener::TcpListener;
 use poem::middleware::Tracing;
-use poem::{get, EndpointExt, Route, Server};
+use poem::{EndpointExt, Route, Server, get};
 
 mod cache;
 mod config;
@@ -16,7 +16,12 @@ use cache::TileCache;
 use config::Config;
 use metrics::Metrics;
 use renderer::Renderer;
-use state::{spawn_janitor, AppState};
+use state::{AppState, spawn_janitor};
+
+/// Longer than the default 60-second renderer timeout, so a tile already being rendered can
+/// finish and write its cache entry before the orchestrator stops the process. Compose gives the
+/// container another five seconds beyond this deadline before resorting to SIGKILL.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(70);
 
 fn build_app(state: AppState) -> impl poem::Endpoint {
     Route::new()
@@ -87,16 +92,49 @@ async fn run() {
     let app = build_app(state);
     let listener = TcpListener::bind(format!("0.0.0.0:{}", config.port));
     Server::new(listener)
-        .run_with_graceful_shutdown(
-            app,
-            async {
-                let _ = tokio::signal::ctrl_c().await;
-                tracing::info!("shutdown signal received");
-            },
-            Some(std::time::Duration::from_secs(10)),
-        )
+        .run_with_graceful_shutdown(app, shutdown_signal(), Some(SHUTDOWN_GRACE))
         .await
         .expect("server failed");
+    tracing::info!("in-flight requests drained; dark-basemap-xyz stopped");
+}
+
+/// Docker and Swarm stop containers with SIGTERM. Listening only for Ctrl+C leaves this process,
+/// which is PID 1 in the image, alive until Docker's grace period expires and it is SIGKILLed in
+/// the middle of any active tile renders.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.expect("failed to listen for Ctrl+C");
+                tracing::info!(
+                    signal = "SIGINT",
+                    "shutdown signal received; draining in-flight requests"
+                );
+            }
+            _ = terminate.recv() => {
+                tracing::info!(
+                    signal = "SIGTERM",
+                    "shutdown signal received; draining in-flight requests"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for Ctrl+C");
+        tracing::info!(
+            signal = "SIGINT",
+            "shutdown signal received; draining in-flight requests"
+        );
+    }
 }
 
 fn main() {

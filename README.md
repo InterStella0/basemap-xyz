@@ -147,6 +147,13 @@ that is the accepted tradeoff for keeping the tiles on the SSD. `scripts/pregene
    docker stack deploy -c compose.swarm.yaml dark-basemap
    ```
 
+The API handles Docker's SIGTERM and drains requests already in flight for up to 70 seconds before
+exiting. Its Compose `stop_grace_period` is 75 seconds so Swarm does not SIGKILL a live tile render
+and turn it into an nginx `upstream prematurely closed connection` 502. Keep that drain window
+longer than `RENDER_TIMEOUT_SECS` if the render timeout is changed. With one API replica on a
+host-published port this protects accepted requests; it does not provide a second backend for new
+connections during the short replacement gap.
+
 Notes:
 
 - There is no `tile_cache` volume any more: the api serves the SSD store via a bind mount, and

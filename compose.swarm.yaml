@@ -42,6 +42,9 @@ services:
   # port below.
   api:
     image: interstella0/dark-basemap:api
+    # The API drains accepted tile renders for up to 70s after SIGTERM. Keep Swarm's deadline
+    # longer so it does not sever those upstream connections with SIGKILL during an update.
+    stop_grace_period: 75s
     env_file:
       # Read from the manager at deploy time; must exist next to this file.
       - .env
