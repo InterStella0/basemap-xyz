@@ -20,8 +20,10 @@ services:
       # actually sits in front of this.
       TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
     volumes:
-      # Read-only: nginx serves from this volume but never writes to it. The API is the only writer.
-      - tile_cache:/var/cache/tiles:ro
+      # Read-only: nginx serves from this directory but never writes to it. The API is the only
+      # writer. On one host this is the durable SSD store the swarm api also uses, so dev and
+      # production serve the same pregenerated tiles.
+      - ${TILES_STORE_DIR:-/mnt/meow/OSM/tiles}:/var/cache/tiles:ro
     ports:
       - "${EXPOSE_PORT:-8080}:80"
     networks:
@@ -51,8 +53,12 @@ services:
     environment:
       RENDERER_URL: http://renderer
       TILE_CACHE_DIR: /var/cache/tiles
+    # The api image runs as uid 10001, but /mnt/meow is a fuseblk (NTFS via FUSE) mount owned
+    # by uid 1000 — that uid cannot write it. Run as sarah instead.
+    user: "1000:1000"
     volumes:
-      - tile_cache:/var/cache/tiles:rw
+      # The durable tile store on the SSD, shared with the swarm deployment on this box.
+      - ${TILES_STORE_DIR:-/mnt/meow/OSM/tiles}:/var/cache/tiles:rw
     networks:
       - default
     logging: *default-logging
@@ -127,9 +133,6 @@ services:
         reservations:
           cpus: '2'
           memory: 512M
-
-volumes:
-  tile_cache:
 
 networks:
   default:

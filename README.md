@@ -38,14 +38,19 @@ Three containers:
 
 ### Why nginx serves the hits
 
-A tile that is already on disk should not cost a proxy hop and a userspace copy. nginx maps the URL
-directly onto the cache volume with `try_files` and `sendfile`s the file; the API only ever sees a
-miss. That makes the concurrency limit for cached tiles "whatever nginx can do", and leaves the Rust
-service with one job.
+A tile that is already on disk should not cost a proxy hop and a userspace copy. On a single
+host, nginx maps the URL directly onto the tile directory with `try_files` and `sendfile`s the
+file; the API only ever sees a miss. That makes the concurrency limit for cached tiles "whatever
+nginx can do", and leaves the Rust service with one job.
 
 The layout `{z}/{x}/{y}.png` is therefore a contract between two files:
 `cache_path()` in `src/tiles.rs` and the `try_files` line in `nginx/nginx.conf`. Change one without
 the other and every hit silently becomes a miss.
+
+> In the **swarm** deployment (below) the reverse proxy runs on the VPS while the tile store and
+> the API live on the home box, so nginx has no directory to `try_files` and proxies every tile
+> to the API over Tailscale. The same `nginx.conf` serves both topologies: without the mount,
+> `try_files` falls through to the API for every request.
 
 ### Why the API is more than a proxy
 
@@ -83,24 +88,32 @@ Database credentials never enter the project file or the image: the layers refer
 
 ## Swarm deployment
 
-`compose.swarm.yaml` splits the stack across two machines: the **renderer** runs on the box that
-holds the OSM detail GeoPackages (they do not fit on the server), while **api + reverse** run on
-the VPS, which stays the public entrypoint and the swarm manager.
+`compose.swarm.yaml` splits the stack across two machines: the **renderer** and the **api** run on
+the home box, which holds the OSM detail GeoPackages, the SSD tile store and Postgres — while
+**reverse** alone runs on the VPS, which stays the public entrypoint and the swarm manager. The api
+moved home so it can read and write the pregenerated tile store on the SSD directly; swarm volumes
+cannot span nodes, so there is no other way for it to touch that disk.
 
 ```
 Internet
   └─ VPS (manager, basemap.role=frontend)
-       ├─ reverse (nginx :80, published :8080 mode=host)
-       └─ api ── RENDERER_URL=http://<home-box-tailscale-ip>:8081 ──┐
-                                                                    │ Tailscale (not the overlay)
-  home box (worker, basemap.role=renderer)                          │
-       └─ renderer (QGIS, published :8081 mode=host) ◄─────────────┘
+       └─ reverse (nginx :80, published :8080 mode=host)
+              └─ API_HOST=http://<home-box-tailscale-ip>:3000 ──┐
+                                                                │ Tailscale (not the overlay)
+  home box (worker, basemap.role=renderer)                      │
+       ├─ api (published :3000 mode=host) ◄─────────────────────┘
+       │     ├─ /mnt/meow/OSM/tiles → /var/cache/tiles (SSD tile store, rw)
+       │     └─ RENDERER_URL=http://renderer (overlay, same node)
+       └─ renderer (QGIS, published :8081 mode=host)
               ├─ /mnt/meow/OSM/out → /data (44 GB of GeoPackages)
               └─ Postgres at DB_HOST (home LAN)
 ```
 
-The api→renderer hop deliberately bypasses the swarm overlay network (its VXLAN cannot traverse a
-home NAT) and goes over Tailscale through a host-published port instead.
+The reverse→api hop bypasses the swarm overlay network (its VXLAN cannot traverse a home NAT) and
+goes over Tailscale through a host-published port, exactly as the old api→renderer hop did. Every
+tile request — hits included — crosses that link, so the home uplink is now the serving bottleneck;
+that is the accepted tradeoff for keeping the tiles on the SSD. `scripts/pregenerate-tiles.py`
+(run on the home box) fills the store ahead of time so the api rarely has to render.
 
 **One-time setup:**
 
@@ -117,14 +130,18 @@ home NAT) and goes over Tailscale through a host-published port instead.
    docker node update --label-add basemap.role=frontend <vps-node>
    docker node update --label-add basemap.role=renderer <home-node>
    ```
-3. Make sure the Tailscale ACL lets the VPS reach the home box on tcp/8081 (or whatever
-   `RENDERER_PUBLISH_PORT` is).
+3. Make sure the Tailscale ACL lets the VPS reach the home box on tcp/3000 (`API_PUBLISH_PORT`)
+   for the api; tcp/8081 (`RENDERER_PUBLISH_PORT`) is only needed if you also want to reach the
+   renderer directly from the VPS.
+4. `/mnt/meow` is a fuseblk (NTFS via FUSE) mount owned by uid 1000, so the api service runs as
+   `user: "1000:1000"` — the image's own uid 10001 cannot write that mount. If the tiles store
+   moves to a normal filesystem, drop the `user:` override.
 
 **Every deploy:**
 
 1. Push the images (`docker stack deploy` does not build): `scripts/push-swarm-images.sh`.
-2. Set `SWARM_RENDERER_URL=http://<home-box-tailscale-ip>:8081` in `.env`, copy that `.env` next
-   to `compose.swarm.yaml` on the VPS (`env_file` and `${...}` interpolation are both read from
+2. Set `SWARM_API_HOST=http://<home-box-tailscale-ip>` in `.env`, copy that `.env` next to
+   `compose.swarm.yaml` on the VPS (`env_file` and `${...}` interpolation are both read from
    the manager at deploy time), then:
    ```sh
    docker stack deploy -c compose.swarm.yaml dark-basemap
@@ -132,13 +149,66 @@ home NAT) and goes over Tailscale through a host-published port instead.
 
 Notes:
 
-- `tile_cache` stays a node-local volume — fine, because api and reverse are both pinned to the
-  VPS node and the renderer never touches it. `PROJECT_VERSION` cache flushing works unchanged.
+- There is no `tile_cache` volume any more: the api serves the SSD store via a bind mount, and
+  both the api and the renderer are pinned to the home box, which is the only node that has that
+  disk.
 - Both published ports use `mode: host` + a placement constraint, so they bind only on their
   intended node and nginx sees real client IPs (its rate limits depend on that).
-- Cross-node overlay/VXLAN errors on the renderer node are benign: no traffic uses the overlay
-  between the two nodes.
+- Cross-node overlay/VXLAN errors on the renderer node are benign: no tile traffic uses the
+  overlay between the two nodes (api→renderer is same-node; reverse→api is Tailscale).
 - `DB_HOST` must stay routable from the renderer node (today: a home-LAN address, unchanged).
+- Migration from the old layout: after deploying and confirming tiles serve, remove the stale
+  node-local volume on the VPS with `docker volume rm dark-basemap_tile_cache`.
+
+## Pregenerating tiles
+
+`scripts/pregenerate-tiles.py` renders whole zoom ranges ahead of time into
+`$TILES_STORE_DIR` (`/mnt/meow/OSM/tiles`), the same directory the api serves from, so static
+data is never re-rendered on demand. Run it on the home box, next to the renderer:
+
+```sh
+scripts/pregenerate-tiles.py --estimate --max-zoom 8   # counts + ETA, renders nothing
+scripts/pregenerate-tiles.py --max-zoom 15             # the real thing, z0..15
+scripts/pregenerate-tiles.py --retry-failed            # re-attempt logged failures
+```
+
+It is built for very long, interruptible runs:
+
+- **Resumable** — tiles already on disk are skipped; Ctrl-C any time and re-run.
+- **Atomic** — writes go to a sibling `.tmp` then rename, exactly like the API, so a
+  half-written PNG is never servable.
+- **Deduplicating** — byte-identical renders become hardlinks to one canonical file per
+  (layer, zoom), and all-same-pixel tiles (empty ocean, empty land) collapse to a canonical
+  blank. Storage cost tracks *distinct* content, not tile count.
+- **Failure-tolerant** — one bad tile never stops the run; failures are logged to
+  `.pregenerate-failures.jsonl` in the store and retried with `--retry-failed`.
+- **Route-aware** — it parses `TILE_LAYER_ROUTES` from `.env` with the same semantics as the
+  API, so z0–3 renders `simple-countries` and z4+ renders `countries` automatically.
+- **Honest about scale** — see the table below.
+
+It also writes the `.project-version` marker into the store, so the API's boot-time version
+sync sees a match instead of wiping the pregenerated tiles.
+
+### How long this takes
+
+Measured on the live renderer: one warm tile takes 0.6–2.8 s, and concurrent renders mostly
+serialize (5 in parallel ≈ 1.1 tiles/s). The cumulative tile counts are unforgiving:
+
+| Range | Tiles | At ~1.5 tiles/s |
+|---|---|---|
+| z0–8 | 87,381 | ~16 h |
+| z0–10 | 1,398,101 | ~11 days |
+| z0–11 | 5,592,405 | ~43 days |
+| z0–12 | 22,369,621 | ~6 months |
+| z0–13 | 89,478,485 | ~2 years |
+| z0–14 | 357,913,941 | ~7.5 years |
+| z0–15 | 1,431,655,765 | ~30 years |
+
+So a full-planet z0–15 is a background job that runs for as long as it runs; start low and let
+it climb. The dedup means most of those tiles cost one render *and one directory entry*, which is
+the other hard limit: a billion files need roughly a terabyte of filesystem metadata alone. The
+script pauses with a warning below `--max-disk-gb` free space rather than filling the disk
+silently, so check `df /mnt/meow` before asking for z13+.
 
 ### When the renderer is down
 
@@ -237,30 +307,33 @@ where one missing file would otherwise take down the whole project.
 
 ## Cache behaviour
 
-Tiles live for `TILE_TTL_DAYS` (120). A janitor sweep runs at boot and every
-`TILE_SWEEP_INTERVAL_HOURS` (6), unlinking expired tiles and orphaned temp files and pruning the
-directories that empties.
+Tiles live for `TILE_TTL_DAYS` — 3650 on the durable store: it is a long-term archive, not a
+scratch cache, and sweeping pregenerated tiles would mean re-rendering them. A janitor sweep runs
+at boot and every `TILE_SWEEP_INTERVAL_HOURS` (24 — the store holds millions of files and the
+walk is not free), unlinking expired tiles and orphaned temp files and pruning the directories
+that empties.
 
 **nginx does not check the TTL** — it serves whatever is on disk. So a tile can survive up to
 `TTL + sweep_interval`. That is intended for a basemap; it is not a bug.
 
 If `PROJECT_VERSION` is set in `.env`, the API compares it against a marker it keeps at the root of
-the tile cache volume on every boot; a mismatch — including "no marker yet" — wipes the whole cache
+the tile store on every boot; a mismatch — including "no marker yet" — wipes the whole store
 before serving anything. `scripts/sync-project-version.sh` sets `PROJECT_VERSION` to a hash of
 `qgis-server/project/project.qgz`, so updating the cartography is: replace the file, run the script,
-`docker compose up -d --build renderer`. Leave `PROJECT_VERSION` empty to opt out and keep pure
-TTL-only behaviour.
+`docker compose up -d --build renderer`, then re-run `scripts/pregenerate-tiles.py` (the wipe made
+every z0–15 tile a miss again, which is exactly right — the cartography changed). Leave
+`PROJECT_VERSION` empty to opt out and keep pure TTL-only behaviour.
 
 Note that `TILE_LAYER_ROUTES` changes tile *content* without changing `project.qgz`, so the hash
 does not move and the cache is **not** flushed automatically. Use the manual flush below after
 editing routes.
 
 For a flush not tied to `project.qgz` (e.g. a database-only or routing change), fall back to the
-manual flush:
+manual flush (the store is a bind mount now, not a named volume):
 
 ```sh
 docker compose stop api reverse
-docker run --rm -v dark-basemap-xyz_tile_cache:/c alpine sh -c 'rm -rf /c/*'
+rm -rf "${TILES_STORE_DIR:-/mnt/meow/OSM/tiles}"/*
 docker compose start api reverse
 ```
 

@@ -8,11 +8,11 @@ services:
   reverse:
     image: interstella0/dark-basemap:reverse
     environment:
-      API_HOST: ${API_HOST:-api}
+      # The api now lives on the home box next to the SSD tile store; every tile request
+      # is proxied to it over Tailscale (see the api's host-published port below).
+      API_HOST: ${SWARM_API_HOST}
       BASEMAP_PUBLIC_URL: ${BASEMAP_PUBLIC_URL:-http://localhost:8080}
       TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
-    volumes:
-      - tile_cache:/var/cache/tiles:ro
     ports:
       - target: 80
         published: ${EXPOSE_PORT:-8080}
@@ -35,20 +35,32 @@ services:
           cpus: '0.05'
           memory: 32M
 
-  # The XYZ cache. Only ever sees misses in the deployed setup: render once, store, hand back.
-  # Talks to the renderer over Tailscale, not the overlay network.
+  # The XYZ cache. Runs on the home box, next to the renderer and the durable tile store on
+  # the SSD (/mnt/meow/OSM/tiles), which is where pregenerated tiles land and everything the
+  # api caches is kept. reverse on the VPS reaches it over Tailscale through the host-published
+  # port below.
   api:
     image: interstella0/dark-basemap:api
     env_file:
       # Read from the manager at deploy time; must exist next to this file.
       - .env
     environment:
-      # Overrides RENDERER_URL from .env: the renderer lives on the home box, reached over
-      # Tailscale through the host-published port below.
-      RENDERER_URL: ${SWARM_RENDERER_URL:-http://renderer}
+      # Same node as the renderer now, so the overlay network works without the Tailscale hop
+      # the old two-node layout needed.
+      RENDERER_URL: http://renderer
       TILE_CACHE_DIR: /var/cache/tiles
+    # The api image runs as uid 10001, but /mnt/meow is a fuseblk (NTFS via FUSE) mount owned
+    # by uid 1000 on the home box — that uid cannot write it. Run as sarah instead.
+    user: "1000:1000"
     volumes:
-      - tile_cache:/var/cache/tiles:rw
+      - ${TILES_STORE_DIR:-/mnt/meow/OSM/tiles}:/var/cache/tiles:rw
+    ports:
+      # mode: host + the renderer-node constraint binds this on the home box only — including
+      # its Tailscale interface, which is how reverse on the VPS reaches it (SWARM_API_HOST).
+      - target: 3000
+        published: ${API_PUBLISH_PORT:-3000}
+        protocol: tcp
+        mode: host
     networks:
       - default
     logging: *default-logging
@@ -64,7 +76,7 @@ services:
     deploy:
       placement:
         constraints:
-          - node.labels.basemap.role == frontend
+          - node.labels.basemap.role == renderer
       restart_policy:
         condition: any
       resources:
@@ -110,8 +122,8 @@ services:
       # project file. Only the renderer mounts this; the API and nginx never see the geometry.
       - ${OSM_DETAIL_DIR:-/mnt/meow/OSM/out}:/data:ro
     ports:
-      # mode: host + the renderer constraint binds this on the home box only — including on its
-      # Tailscale interface, which is how the api on the VPS reaches it (SWARM_RENDERER_URL).
+      # mode: host + the renderer constraint binds this on the home box only — which is where
+      # scripts/pregenerate-tiles.py (localhost) and the api (overlay, same node) reach it.
       - target: 80
         published: ${RENDERER_PUBLISH_PORT:-8081}
         protocol: tcp
@@ -132,9 +144,6 @@ services:
         reservations:
           cpus: '2'
           memory: 512M
-
-volumes:
-  tile_cache:
 
 networks:
   default:
