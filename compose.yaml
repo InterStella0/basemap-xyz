@@ -90,7 +90,7 @@ services:
       QGIS_PROJECT_FILE: /home/qgis/project/project.qgz
       QGIS_SERVER_LOG_LEVEL: ${QGIS_SERVER_LOG_LEVEL:-1}
       QGIS_SERVER_PARALLEL_RENDERING: "1"
-      QGIS_SERVER_MAX_THREADS: "4"
+      QGIS_SERVER_MAX_THREADS: "8"
       # Skips re-reading extent and geometry type from every PostGIS layer on project load. By far
       # the biggest cold-start win for a database-backed project; safe as long as the .qgz is
       # rebuilt when the schema changes.
@@ -119,11 +119,13 @@ services:
     logging: *default-logging
     deploy:
       resources:
+        # 6 of the 8 cores; the rest of the box runs other stacks. The old 1-CPU cap throttled
+        # QGIS's parallel rendering to an eighth of the host.
         limits:
-          cpus: '1'
+          cpus: '6'
           memory: 2G
         reservations:
-          cpus: '0.5'
+          cpus: '2'
           memory: 512M
 
 volumes:
