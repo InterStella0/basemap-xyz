@@ -52,6 +52,11 @@
       <li>256 px PNG</li>
       <li>EPSG:4326</li>
     </ul>
+
+    <div class="layer-picker" data-layer-picker role="group" aria-label="Layer">
+      <button type="button" data-layer="countries" aria-pressed="true">countries</button>
+      <button type="button" data-layer="simple-countries" aria-pressed="false">simple-countries</button>
+    </div>
   </div>
 
 </header>
@@ -88,7 +93,25 @@
 <section id="use" class="section">
   <p class="kicker">How to use</p>
   <h2>Pick your tool.</h2>
-  <p class="section-lede">Every snippet already includes the attribution you're required to display.</p>
+  <p class="section-lede">Every snippet already includes the attribution you're required to display.
+  Pick a layer and the snippets below update with it.</p>
+
+  <div class="demo">
+    <div class="demo-bar">
+      <div class="layer-picker" data-layer-picker role="group" aria-label="Layer">
+        <button type="button" data-layer="countries" aria-pressed="true">countries</button>
+        <button type="button" data-layer="simple-countries" aria-pressed="false">simple-countries</button>
+      </div>
+      <p class="demo-zoom" id="demo-zoom" aria-live="polite"></p>
+    </div>
+    <div class="demo-map" id="demo-map"></div>
+    <div class="note demo-note"><p>
+      <code>countries</code> is the one you want: it is served from generalized Natural Earth
+      polygons zoomed out and switches to the full OpenStreetMap detail at <strong>z4</strong>, all
+      under the one URL. <code>simple-countries</code> is the generalized layer on its own, and goes
+      blank past z5 &mdash; it is there so you can see the difference.
+    </p></div>
+  </div>
 
   <div class="tabs">
     <div class="tablist" role="tablist" aria-label="Client examples">

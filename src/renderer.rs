@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 
+use crate::config::LayerRoutes;
 use crate::metrics::Metrics;
 use crate::tiles::TileCoord;
 
@@ -36,6 +37,9 @@ pub struct Renderer {
     permits: Arc<Semaphore>,
     queue_timeout: Duration,
     metrics: Arc<Metrics>,
+    /// Resolved per request, not per coordinate: the routing table only ever affects the outbound
+    /// WMTS `LAYER`, never the cache key, so it lives here rather than on `TileCoord`.
+    routes: LayerRoutes,
 }
 
 impl Renderer {
@@ -45,6 +49,7 @@ impl Renderer {
         queue_timeout: Duration,
         request_timeout: Duration,
         metrics: Arc<Metrics>,
+        routes: LayerRoutes,
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(request_timeout)
@@ -62,6 +67,7 @@ impl Renderer {
             permits: Arc::new(Semaphore::new(concurrency)),
             queue_timeout,
             metrics,
+            routes,
         }
     }
 
@@ -88,11 +94,12 @@ impl Renderer {
             }
         };
 
+        let upstream = self.routes.resolve(&coord.layer, coord.z);
         let started = Instant::now();
         let response = self
             .client
             .get(self.ows_url())
-            .query(&coord.wmts_query())
+            .query(&coord.wmts_query(upstream))
             .send()
             .await
             .map_err(|err| {
@@ -134,7 +141,7 @@ impl Renderer {
 
         Metrics::bump(&self.metrics.renders);
         Metrics::add(&self.metrics.render_millis_total, started.elapsed().as_millis() as u64);
-        tracing::debug!(%coord, ms = started.elapsed().as_millis(), bytes = body.len(), "rendered tile");
+        tracing::debug!(%coord, upstream, ms = started.elapsed().as_millis(), bytes = body.len(), "rendered tile");
         Ok(body)
     }
 
@@ -216,6 +223,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_secs(1),
             Arc::new(Metrics::default()),
+            LayerRoutes::default(),
         );
         let held = renderer.permits.clone().acquire_owned().await.unwrap();
         assert_eq!(renderer.available_permits(), 0);
@@ -234,6 +242,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(2),
             Arc::new(Metrics::default()),
+            LayerRoutes::default(),
         );
         assert!(renderer.fetch(&TileCoord::new("layer", 0, 0, 0)).await.is_err());
         assert!(renderer.probe().await.is_err());
@@ -248,6 +257,7 @@ mod tests {
                 Duration::from_secs(1),
                 Duration::from_secs(1),
                 Arc::new(Metrics::default()),
+                LayerRoutes::default(),
             )
             .ows_url()
         };

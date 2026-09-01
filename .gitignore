@@ -1,6 +1,9 @@
 /target
 .env
 
+# Written by scripts/patch-project.py before it rewrites the project.
+*.qgz.bak
+
 
 # RustRover / IntelliJ
 /.idea/

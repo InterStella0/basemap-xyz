@@ -37,4 +37,5 @@ fi
 mv "$tmp_file" "$env_file"
 
 echo "PROJECT_VERSION set to $version"
-echo "Now run: docker compose up -d"
+
+echo "Now run: docker compose up -d --build renderer"

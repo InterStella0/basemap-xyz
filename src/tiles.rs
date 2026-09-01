@@ -31,6 +31,17 @@ pub enum TileError {
     InvalidLayer(String),
 }
 
+/// The conservative charset for anything that can end up as a path segment or a WMTS `LAYER`
+/// value. Applied to the caller-supplied layer in the URL *and* to the operator-supplied upstream
+/// names in `TILE_LAYER_ROUTES`, so a route cannot smuggle in a shape the URL parser would reject.
+/// Mirrored by the location regex in `nginx/nginx.conf`.
+pub fn is_safe_layer_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && name != "."
+        && name != ".."
+}
+
 impl TileCoord {
     pub fn new(layer: impl Into<String>, z: u8, x: u32, y: u32) -> Self {
         Self { layer: layer.into(), z, x, y }
@@ -41,14 +52,7 @@ impl TileCoord {
     /// spend renderer processes producing ServiceExceptions; without the layer check, a layer
     /// segment containing `..` or `/` could escape the cache directory entirely.
     pub fn validate(&self, min_zoom: u8, max_zoom: u8) -> Result<(), TileError> {
-        let layer_ok = !self.layer.is_empty()
-            && self
-                .layer
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-            && self.layer != "."
-            && self.layer != "..";
-        if !layer_ok {
+        if !is_safe_layer_name(&self.layer) {
             return Err(TileError::InvalidLayer(self.layer.clone()));
         }
 
@@ -90,12 +94,18 @@ impl TileCoord {
     /// to work against this same image: TILEMATRIX is the bare zoom number within the `EPSG:3857`
     /// tile matrix set, and TILEROW takes the XYZ `y` directly because QGIS's 3857 matrix set is
     /// also top-left origin.
-    pub fn wmts_query(&self) -> Vec<(&'static str, String)> {
+    ///
+    /// `upstream_layer` is passed in rather than read from `self.layer` so that zoom-based routing
+    /// (`TILE_LAYER_ROUTES`) can render a tile from a different QGIS layer than the one named in
+    /// the URL. It must stay a parameter and never become a field: `TileCoord` is the disk path and
+    /// the single-flight key, so a coordinate that renders from two upstreams at different zooms is
+    /// still exactly one cache entry per z/x/y.
+    pub fn wmts_query(&self, upstream_layer: &str) -> Vec<(&'static str, String)> {
         vec![
             ("SERVICE", "WMTS".to_string()),
             ("VERSION", "1.0.0".to_string()),
             ("REQUEST", "GetTile".to_string()),
-            ("LAYER", self.layer.clone()),
+            ("LAYER", upstream_layer.to_string()),
             ("STYLE", "default".to_string()),
             ("FORMAT", "image/png".to_string()),
             ("TILEMATRIXSET", "EPSG:3857".to_string()),
@@ -192,12 +202,36 @@ mod tests {
 
     #[test]
     fn wmts_query_matches_the_known_good_parameter_shape() {
-        let q = TileCoord::new("darkbasemap", 9, 271, 171).wmts_query();
+        let q = TileCoord::new("darkbasemap", 9, 271, 171).wmts_query("darkbasemap");
         let encoded: Vec<String> = q.iter().map(|(k, v)| format!("{k}={v}")).collect();
         assert_eq!(
             encoded.join("&"),
             "SERVICE=WMTS&VERSION=1.0.0&REQUEST=GetTile&LAYER=darkbasemap&STYLE=default\
              &FORMAT=image/png&TILEMATRIXSET=EPSG:3857&TILEMATRIX=9&TILECOL=271&TILEROW=171"
         );
+    }
+
+    /// The routing case: the URL says `countries`, the render comes from `simple-countries`.
+    #[test]
+    fn wmts_query_asks_for_the_upstream_layer_not_the_requested_one() {
+        let coord = TileCoord::new("countries", 3, 4, 3);
+        let q = coord.wmts_query("simple-countries");
+        let layer = q.iter().find(|(k, _)| *k == "LAYER").map(|(_, v)| v.as_str());
+        assert_eq!(layer, Some("simple-countries"));
+        // The cache path is unaffected: it follows the requested name, which is what nginx serves.
+        assert_eq!(
+            coord.cache_path(Path::new("/var/cache/tiles")),
+            Path::new("/var/cache/tiles/countries/3/4/3.png")
+        );
+    }
+
+    #[test]
+    fn safe_layer_names_agree_with_the_coordinate_validator() {
+        for good in ["countries", "simple-countries", "dark-basemap_v2.1"] {
+            assert!(is_safe_layer_name(good), "{good:?} should be accepted");
+        }
+        for bad in ["", "..", ".", "../../etc", "a/b", "a b", "layer\0"] {
+            assert!(!is_safe_layer_name(bad), "{bad:?} should be rejected");
+        }
     }
 }

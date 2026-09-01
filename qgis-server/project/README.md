@@ -1,28 +1,52 @@
-# Drop `project.qgz` here
+# `project.qgz`
 
-The image expects `qgis-server/project/project.qgz`. It is gitignored — the cartography is yours to
-version however you like, but a `docker compose build` will fail without it.
+The image expects `qgis-server/project/project.qgz`. It is **copied into the renderer image**, not
+mounted — so after any change you need `docker compose up -d --build renderer`, not just `up -d`.
+A plain `up -d` flushes the tile cache and then refills it from the old cartography still baked into
+the running image, which looks exactly like the change silently not working.
 
-## What the current project needs before it will serve tiles
+## What the project publishes
 
-Checked against the `project.qgz` in this directory:
+Two WMTS names, both served through the single public URL `/tiles/countries/{z}/{x}/{y}.png`; the
+API picks between them per zoom via `TILE_LAYER_ROUTES` (see the main README).
 
-1. **WMTS is not published yet.** The project contains no WMTS configuration at all, so `GetTile`
-   returns a `ServerException` rather than a PNG. In QGIS Desktop go to
-   **Project → Properties → QGIS Server → WMTS**, add the layer or group you want served, and tick
-   **EPSG:3857**. That is what creates the tile matrix set the API asks for by name.
-2. **Layer name.** The project currently publishes one layer, `countries`, but the API has no
-   fixed idea of which layer to serve — every WMTS-published layer's short name is reachable
-   directly at `/tiles/{layer}/{z}/{x}/{y}.png`. Publish as many layers as you like under
-   **QGIS Server → WMTS** and each becomes servable without touching `.env`.
-3. **Database service name.** The layer datasource references `service=mellabasemap`.
-   `PG_SERVICE_NAME` in `.env` must match it exactly; `entrypoint.sh` writes the matching
-   `pg_service.conf` at container start.
-4. **Credentials.** `DB_USERNAME` and `DB_PASSWORD` are empty in `default.env`. Until they are set,
-   the renderer logs `fe_sendauth: no password supplied` and every layer loads as invalid.
+| WMTS name | What it is | Source |
+|---|---|---|
+| `simple-countries` | 258 Natural Earth Admin-0 polygons. Cheap at continental scale. | PostGIS `public.countries` via `service=mellabasemap` |
+| `countries` | A **group** of OSM layers — country polygons, water, landuse, roads, optionally buildings. | GeoPackages at `/data/*.gpkg` |
+
+Publishing a *group* rather than a layer is what lets several styled layers answer to one name.
+Each layer inside the group carries its own scale-based visibility, so QGIS does not query the
+buildings GeoPackage at z8 at all.
+
+## Editing the cartography
+
+`project.qgz` is a zip, so git sees one opaque binary blob. `scripts/patch-project.py` is the
+reviewable source of truth instead — it is idempotent and re-applies the same intent:
+
+```sh
+python3 scripts/patch-project.py --base     # rename the PostGIS layer, fix the WMTS pyramid depth
+python3 scripts/patch-project.py --detail   # add the OSM group (needs the GeoPackages to exist)
+```
+
+Editing in QGIS Desktop is still fine; re-run the script afterwards to re-assert the parts it owns.
+It keeps the previous file at `project.qgz.bak`.
+
+## Settings that must stay in step
+
+1. **CRS.** Publish EPSG:3857 under **Project → Properties → QGIS Server → WMTS** — that is what
+   creates the tile matrix set the API asks for by name.
+2. **Pyramid depth.** `WMTSGrids/Config` carries a level count and `WMTSMinScale` truncates it
+   further. These were 18 levels and `5004`, which capped the service at z16 while `.env` advertised
+   `MAX_ZOOM=20`, so z17–20 returned `ServiceException`. `--base` sets 21 levels and `WMTSMinScale=0`.
+   If you change `MAX_ZOOM`, change these too.
+3. **Database service name.** The PostGIS layer references `service=mellabasemap`; `PG_SERVICE_NAME`
+   in `.env` must match exactly. `entrypoint.sh` writes the matching `pg_service.conf` at start.
+4. **Detail layer paths.** The OSM layers reference `/data/<theme>.gpkg`, which is
+   `${OSM_DETAIL_DIR}` bind-mounted read-only by `compose.yaml`. The container path is contractual —
+   changing it invalidates the project file.
 5. **QGIS version.** This project was saved by QGIS **4.2.1**, so `QGIS_VERSION` is pinned to
-   `4.2.1`. Loading it under an older image (`ltr` was 3.44) makes QGIS warn
-   "Problems may occur" — keep the two in step when you upgrade the desktop.
+   `4.2.1`. Keep the two in step when you upgrade the desktop.
 
-Keep credentials out of the project file: reference the connection as `service=<name>` with no
-host, user or password inline, and let the entrypoint supply the rest from the `DB_*` variables.
+Keep credentials out of the project file: reference the connection as `service=<name>` with no host,
+user or password inline, and let the entrypoint supply the rest from the `DB_*` variables.

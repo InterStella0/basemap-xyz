@@ -66,16 +66,102 @@ render finishes. The API handles that with:
 
 1. **Add your project.** Drop `project.qgz` into `qgis-server/project/` — see the README there for
    the two settings QGIS Desktop needs (publish the layer for WMTS, tick EPSG:3857). Whenever you
-   replace it later, run `scripts/sync-project-version.sh` and then `docker compose up -d` — that
-   flushes the tile cache immediately instead of waiting out `TILE_TTL_DAYS`.
+   replace it later, run `scripts/sync-project-version.sh` and then
+   `docker compose up -d --build renderer`. The `--build` matters: `qgis-server/Dockerfile` *copies*
+   the project into the image rather than mounting it, so a plain `up -d` flushes the tile cache and
+   then refills it from the old cartography still baked into the running image.
 2. **Configure.** `cp default.env .env` and fill in `BASEMAP_PUBLIC_URL` and the `DB_*` values.
 3. **Run.** `docker compose up -d --build`
+4. **(Optional) Add OSM detail.** `scripts/build-osm-detail.sh` then
+   `scripts/patch-project.py --detail` — see [Zoom-tiered detail](#zoom-tiered-detail).
 
 The site and tiles are then on `${EXPOSE_PORT}` (8080 by default).
 
 Database credentials never enter the project file or the image: the layers reference
 `service=mellabasemap`, and `qgis-server/entrypoint.sh` writes the matching `pg_service.conf` and
 `.pgpass` at container start.
+
+## Zoom-tiered detail
+
+One public URL, two different QGIS layers behind it. Zoomed out, tiles come from `simple-countries`
+— 258 Natural Earth polygons in PostGIS, cheap to draw at continental scale. Zoomed in, they come
+from `countries`, a group of OpenStreetMap layers in GeoPackages. Clients never see the seam.
+
+`TILE_LAYER_ROUTES` in `.env` is the switch:
+
+```
+TILE_LAYER_ROUTES=countries@0-5=simple-countries
+```
+
+Comma-separated `<public>@<lo>-<hi>=<upstream>`; first match wins, and any layer or zoom without a
+rule renders from its own name. So the line above sends z0–5 to `simple-countries` and leaves z6–20
+on `countries`. A malformed rule is a boot panic, not a silent fallback.
+
+The tile is always cached under the **public** name, so `/tiles/countries/9/271/171.png` lives at
+`countries/9/271/171.png` on the volume no matter which layer drew it — nginx's `try_files` knows
+nothing about routing and does not need to.
+
+### Building the detail store
+
+QGIS can open a `.osm.pbf`, but it cannot serve tiles from one: GDAL's OSM driver has no spatial
+index, so a bbox query decompresses and scans the whole file. Measured on this data, 32 MB takes
+1.4 s and 752 MB takes 38 s — linear, which puts a 33 GB extract at ~28 minutes for a single tile.
+A GeoPackage is also just a file, but it carries an R-tree, so the same query is milliseconds.
+
+```sh
+scripts/build-osm-detail.sh              # .osm.pbf -> GeoPackages (hours; resumable)
+python3 scripts/patch-project.py --detail  # add the layers to project.qgz
+scripts/sync-project-version.sh
+docker compose up -d --build renderer
+```
+
+The script reads every `*.osm.pbf` in `/mnt/meow/OSM` and writes one GeoPackage per theme into
+`$OSM_DETAIL_DIR`, which `compose.yaml` mounts read-only at `/data` in the renderer. It records
+finished `(theme, region)` pairs, so an interrupted run resumes instead of restarting.
+
+Raw OSM will not fit a sane disk budget — full-resolution planet geometry is ~358 GB, half of it
+building footprints. The default profile therefore filters by class and simplifies geometry to a
+tolerance that is sub-pixel at the zoom each layer draws at, an **18×** reduction on a test extract
+(4.1 GB → 224 MB).
+
+Measured on the full planet (all 8 Geofabrik continent extracts, 79 GB of `.osm.pbf`, ~14 h):
+
+| Theme | Features | Size |
+|---|---|---|
+| `landuse` | 73,362,104 | 30 GB |
+| `water` | 23,699,230 | 8.5 GB |
+| `roads` | ~29,000,000 | 6.0 GB |
+| `countries` (unused, see below) | 375 | 31 MB |
+| **total** | | **44.5 GB** |
+
+A tile-sized bbox query against the 30 GB `landuse` file returns in **~40 ms**. The same query
+against the raw `.osm.pbf` would take ~28 minutes; that difference is the entire reason this
+conversion exists.
+
+| Variable | |
+|---|---|
+| `REGIONS` | Only build these extracts (substring match). Empty = all. |
+| `BUILDING_REGIONS` | Build building footprints for these extracts only. Empty = skip buildings entirely. Planet-wide they are ~179 GB on their own, at ~250 bytes per footprint, and they only render at z15+. |
+| `CPL_TMPDIR` | **Must have tens of GB free.** GDAL's OSM driver spills a temp SQLite DB here; if it runs out of space the driver fails *silently* and writes a valid but empty GeoPackage. Defaults to `/mnt/meow/OSM/tmp`, deliberately not `/tmp` (a 7.4 GB tmpfs on this host). |
+
+### Why the land base is Natural Earth, not OSM
+
+The detail group draws OSM water, landuse and roads on top of a land polygon that comes from the
+*PostGIS Natural Earth table* — the same data `simple-countries` uses — rather than from OSM
+`admin_level=2` boundaries. That is not for lack of trying: the planet build did produce a
+`countries.gpkg` from OSM, and it is unusable as a base. GDAL's OSM driver cannot reliably assemble
+the largest boundary relations, and gives up with `Non closed ring detected`. Measured on the
+finished build, 4 of 12 sample cities had no land polygon at all — Paris, Madrid, New York and
+Moscow, i.e. France, Spain, the USA and Russia. Those are exactly the countries with scattered
+overseas territories, or (Russia) an antimeridian crossing.
+
+Natural Earth is generalized, so coastlines are coarser at z14+ than OSM would be. It is also
+complete, and for the layer everything else is stacked on, complete beats precise. `countries.gpkg`
+is still built and left in place; nothing references it.
+
+`patch-project.py` skips any theme whose GeoPackage is absent, so a run without buildings produces a
+working project rather than a broken one — QGIS Server runs with `QGIS_SERVER_IGNORE_BAD_LAYERS=0`,
+where one missing file would otherwise take down the whole project.
 
 ## Cache behaviour
 
@@ -90,10 +176,15 @@ If `PROJECT_VERSION` is set in `.env`, the API compares it against a marker it k
 the tile cache volume on every boot; a mismatch — including "no marker yet" — wipes the whole cache
 before serving anything. `scripts/sync-project-version.sh` sets `PROJECT_VERSION` to a hash of
 `qgis-server/project/project.qgz`, so updating the cartography is: replace the file, run the script,
-`docker compose up -d`. Only `api`'s config changed, so compose recreates just that container — no
-image rebuild needed. Leave `PROJECT_VERSION` empty to opt out and keep pure TTL-only behaviour.
+`docker compose up -d --build renderer`. Leave `PROJECT_VERSION` empty to opt out and keep pure
+TTL-only behaviour.
 
-For a flush not tied to `project.qgz` (e.g. a database-only change), fall back to the manual flush:
+Note that `TILE_LAYER_ROUTES` changes tile *content* without changing `project.qgz`, so the hash
+does not move and the cache is **not** flushed automatically. Use the manual flush below after
+editing routes.
+
+For a flush not tied to `project.qgz` (e.g. a database-only or routing change), fall back to the
+manual flush:
 
 ```sh
 docker compose stop api reverse

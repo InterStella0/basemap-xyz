@@ -66,6 +66,7 @@ async fn run() {
         config.render_queue_timeout,
         config.render_timeout,
         metrics.clone(),
+        config.layer_routes.clone(),
     ));
 
     let state = AppState::new(config.clone(), cache, renderer, metrics);
@@ -77,6 +78,7 @@ async fn run() {
         ttl_days = config.tile_ttl.as_secs() / 86_400,
         zoom = format!("{}..={}", config.min_zoom, config.max_zoom),
         render_concurrency = config.render_concurrency,
+        layer_routes = ?config.layer_routes,
         "dark-basemap-xyz starting"
     );
 
@@ -123,6 +125,10 @@ mod route_tests {
     /// fast, which is exactly what the routing and validation tests want: a request that gets a
     /// 502 provably went past validation, and a 404 provably did not.
     fn test_state() -> AppState {
+        test_state_with_routes(config::LayerRoutes::default())
+    }
+
+    fn test_state_with_routes(layer_routes: config::LayerRoutes) -> AppState {
         let dir = std::env::temp_dir().join(format!(
             "dark-basemap-routes-{}-{:?}",
             std::process::id(),
@@ -147,6 +153,7 @@ mod route_tests {
             memory_ttl: Duration::from_secs(60),
             negative_ttl: Duration::from_secs(60),
             project_version: None,
+            layer_routes,
         });
         let metrics = Arc::new(Metrics::default());
         let cache = Arc::new(TileCache::new(dir, config.tile_ttl));
@@ -156,6 +163,7 @@ mod route_tests {
             config.render_queue_timeout,
             config.render_timeout,
             metrics.clone(),
+            config.layer_routes.clone(),
         ));
         AppState::new(config, cache, renderer, metrics)
     }
@@ -225,6 +233,29 @@ mod route_tests {
         let cli = TestClient::new(build_app(state));
         cli.get("/tiles/countries/9/271/171.png").send().await.assert_bytes(countries).await;
         cli.get("/tiles/roads/9/271/171.png").send().await.assert_bytes(roads).await;
+    }
+
+    /// Routing must change only where the pixels come from, never where they are stored. The disk
+    /// layout is a contract with nginx's `try_files` (which knows nothing about routes), so a
+    /// routed tile has to remain reachable under the name in the URL.
+    #[tokio::test]
+    async fn a_routed_layer_still_caches_under_the_requested_name() {
+        let state = test_state_with_routes("countries@0-5=simple-countries".parse().unwrap());
+        let payload = bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\nrouted");
+        // Stored under the *public* name, which is what cache_path() and nginx both use.
+        state.cache.store(&TileCoord::new("countries", 3, 4, 3), &payload).await.unwrap();
+
+        let cli = TestClient::new(build_app(state.clone()));
+        let resp = cli.get("/tiles/countries/3/4/3.png").send().await;
+        resp.assert_status_is_ok();
+        resp.assert_bytes(payload).await;
+
+        assert_eq!(Metrics::get(&state.metrics.disk_hits), 1);
+        assert_eq!(
+            Metrics::get(&state.metrics.render_errors),
+            0,
+            "the tile was cached under the requested name, so the dead renderer was never called"
+        );
     }
 
     #[tokio::test]

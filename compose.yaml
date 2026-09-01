@@ -108,6 +108,12 @@ services:
       DB_PORT: ${DB_PORT}
       DB_USERNAME: ${DB_USERNAME}
       DB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      # The OSM detail GeoPackages built by scripts/build-osm-detail.sh. Read-only: QGIS reads them
+      # per tile and nothing in the stack writes them. The layers in project.qgz reference this path
+      # as /data/<theme>.gpkg, so the container path is contractual — changing it invalidates the
+      # project file. Only the renderer mounts this; the API and nginx never see the geometry.
+      - ${OSM_DETAIL_DIR:-/mnt/meow/OSM/out}:/data:ro
     networks:
       - default
     logging: *default-logging
