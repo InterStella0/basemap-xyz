@@ -1,0 +1,140 @@
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  reverse:
+    image: interstella0/dark-basemap:reverse
+    environment:
+      API_HOST: ${API_HOST:-api}
+      BASEMAP_PUBLIC_URL: ${BASEMAP_PUBLIC_URL:-http://localhost:8080}
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
+    volumes:
+      - tile_cache:/var/cache/tiles:ro
+    ports:
+      - target: 80
+        published: ${EXPOSE_PORT:-8080}
+        protocol: tcp
+        mode: host
+    networks:
+      - default
+    logging: *default-logging
+    deploy:
+      placement:
+        constraints:
+          - node.labels.basemap.role == frontend
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 64M
+
+  # The XYZ cache. Only ever sees misses in the deployed setup: render once, store, hand back.
+  # Talks to the renderer over Tailscale, not the overlay network.
+  api:
+    image: interstella0/dark-basemap:api
+    env_file:
+      # Read from the manager at deploy time; must exist next to this file.
+      - .env
+    environment:
+      # Overrides RENDERER_URL from .env: the renderer lives on the home box, reached over
+      # Tailscale through the host-published port below.
+      RENDERER_URL: ${SWARM_RENDERER_URL:-http://renderer}
+      TILE_CACHE_DIR: /var/cache/tiles
+    volumes:
+      - tile_cache:/var/cache/tiles:rw
+    networks:
+      - default
+    logging: *default-logging
+    healthcheck:
+      # /health/live, not /health: the latter probes QGIS, and a 10s poll would hold one of the
+      # renderer's few FCGI slots permanently. Liveness is what the orchestrator can actually act
+      # on; the renderer's state is reported by /health for humans.
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      placement:
+        constraints:
+          - node.labels.basemap.role == frontend
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  renderer:
+    image: interstella0/dark-basemap:renderer
+    env_file:
+      - .env
+    environment:
+      LANG: en_EN.UTF-8
+      QGIS_PROJECT_FILE: /home/qgis/project/project.qgz
+      QGIS_SERVER_LOG_LEVEL: ${QGIS_SERVER_LOG_LEVEL:-1}
+      QGIS_SERVER_PARALLEL_RENDERING: "1"
+      QGIS_SERVER_MAX_THREADS: "4"
+      # Skips re-reading extent and geometry type from every PostGIS layer on project load. By far
+      # the biggest cold-start win for a database-backed project; safe as long as the .qgz is
+      # rebuilt when the schema changes.
+      QGIS_SERVER_TRUST_LAYER_METADATA: "1"
+      QGIS_SERVER_IGNORE_BAD_LAYERS: "0"
+      QGIS_SERVER_CACHE_SIZE: "100"
+      # The API's RENDER_CONCURRENCY should stay at or below this; queueing beyond it just moves
+      # the backlog inside QGIS where we cannot time it out.
+      FCGID_MAX_PROCESSES: ${FCGID_MAX_PROCESSES:-5}
+      FCGID_MIN_PROCESSES: "2"
+      # Must equal the `service=` name inside project.qgz.
+      PG_SERVICE_NAME: ${PG_SERVICE_NAME:-mellabasemap}
+      DB_NAME: ${DB_NAME}
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      # The OSM detail GeoPackages built by scripts/build-osm-detail.sh. Read-only: QGIS reads them
+      # per tile and nothing in the stack writes them. The layers in project.qgz reference this path
+      # as /data/<theme>.gpkg, so the container path is contractual — changing it invalidates the
+      # project file. Only the renderer mounts this; the API and nginx never see the geometry.
+      - ${OSM_DETAIL_DIR:-/mnt/meow/OSM/out}:/data:ro
+    ports:
+      # mode: host + the renderer constraint binds this on the home box only — including on its
+      # Tailscale interface, which is how the api on the VPS reaches it (SWARM_RENDERER_URL).
+      - target: 80
+        published: ${RENDERER_PUBLISH_PORT:-8081}
+        protocol: tcp
+        mode: host
+    networks:
+      - default
+    logging: *default-logging
+    deploy:
+      placement:
+        constraints:
+          - node.labels.basemap.role == renderer
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  tile_cache:
+
+networks:
+  default:
+    driver: overlay

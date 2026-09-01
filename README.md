@@ -81,6 +81,78 @@ Database credentials never enter the project file or the image: the layers refer
 `service=mellabasemap`, and `qgis-server/entrypoint.sh` writes the matching `pg_service.conf` and
 `.pgpass` at container start.
 
+## Swarm deployment
+
+`compose.swarm.yaml` splits the stack across two machines: the **renderer** runs on the box that
+holds the OSM detail GeoPackages (they do not fit on the server), while **api + reverse** run on
+the VPS, which stays the public entrypoint and the swarm manager.
+
+```
+Internet
+  └─ VPS (manager, basemap.role=frontend)
+       ├─ reverse (nginx :80, published :8080 mode=host)
+       └─ api ── RENDERER_URL=http://<home-box-tailscale-ip>:8081 ──┐
+                                                                    │ Tailscale (not the overlay)
+  home box (worker, basemap.role=renderer)                          │
+       └─ renderer (QGIS, published :8081 mode=host) ◄─────────────┘
+              ├─ /mnt/meow/OSM/out → /data (44 GB of GeoPackages)
+              └─ Postgres at DB_HOST (home LAN)
+```
+
+The api→renderer hop deliberately bypasses the swarm overlay network (its VXLAN cannot traverse a
+home NAT) and goes over Tailscale through a host-published port instead.
+
+**One-time setup:**
+
+1. Join the home box to the existing swarm (a node can only be in one swarm; leave any old one
+   first with `docker swarm leave --force`):
+   ```sh
+   # on the VPS:
+   docker swarm join-token worker
+   # on the home box:
+   docker swarm join --token <token> <vps-tailscale-ip>:2377
+   ```
+2. Label the nodes on the VPS — placement constraints match these labels, not hostnames:
+   ```sh
+   docker node update --label-add basemap.role=frontend <vps-node>
+   docker node update --label-add basemap.role=renderer <home-node>
+   ```
+3. Make sure the Tailscale ACL lets the VPS reach the home box on tcp/8081 (or whatever
+   `RENDERER_PUBLISH_PORT` is).
+
+**Every deploy:**
+
+1. Push the images (`docker stack deploy` does not build): `scripts/push-swarm-images.sh`.
+2. Set `SWARM_RENDERER_URL=http://<home-box-tailscale-ip>:8081` in `.env`, copy that `.env` next
+   to `compose.swarm.yaml` on the VPS (`env_file` and `${...}` interpolation are both read from
+   the manager at deploy time), then:
+   ```sh
+   docker stack deploy -c compose.swarm.yaml dark-basemap
+   ```
+
+Notes:
+
+- `tile_cache` stays a node-local volume — fine, because api and reverse are both pinned to the
+  VPS node and the renderer never touches it. `PROJECT_VERSION` cache flushing works unchanged.
+- Both published ports use `mode: host` + a placement constraint, so they bind only on their
+  intended node and nginx sees real client IPs (its rate limits depend on that).
+- Cross-node overlay/VXLAN errors on the renderer node are benign: no traffic uses the overlay
+  between the two nodes.
+- `DB_HOST` must stay routable from the renderer node (today: a home-LAN address, unchanged).
+
+### When the renderer is down
+
+A circuit breaker in the API counts consecutive transport-level failures (`RENDER_FAILURE_THRESHOLD`,
+default 3). Once tripped it fails every render attempt fast for `RENDER_CIRCUIT_OPEN_SECS` (default
+30) instead of letting each uncached tile burn the full `RENDER_TIMEOUT_SECS`. Any response from the
+renderer — even an HTTP error — resets it.
+
+While the renderer is unreachable, an uncached tile answers **503 + `Retry-After: 30` +
+`no-store`**, and the negative cache is deliberately skipped for that class so every miss keeps
+answering 503 rather than mixing in 502s. Cached tiles keep serving as normal nginx hits, `/health`
+reports `degraded`, and `/stats` gains `circuit_opens` and `renderer_unavailable` counters. A tile
+the renderer *answered* badly (bad layer, service exception) remains a negative-cached 502.
+
 ## Zoom-tiered detail
 
 One public URL, two different QGIS layers behind it. Zoomed out, tiles come from `simple-countries`

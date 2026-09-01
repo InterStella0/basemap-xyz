@@ -118,6 +118,13 @@ pub struct Config {
     pub render_concurrency: usize,
     pub render_queue_timeout: Duration,
     pub render_timeout: Duration,
+    /// Consecutive transport-level failures (connection refused, timeout) before the renderer is
+    /// declared down and the circuit opens. Any response at all — even an HTTP 500 — resets the
+    /// counter, because an answer proves the process is alive.
+    pub render_failure_threshold: u32,
+    /// How long the circuit stays open once tripped. While open, uncached tiles fail fast with a
+    /// 503 instead of each burning `render_timeout` against a dead renderer.
+    pub render_circuit_open: Duration,
     pub memory_capacity: u64,
     pub memory_ttl: Duration,
     pub negative_ttl: Duration,
@@ -162,6 +169,8 @@ impl Config {
                 20,
             )),
             render_timeout: Duration::from_secs(get_env_default("RENDER_TIMEOUT_SECS", 60)),
+            render_failure_threshold: get_env_default("RENDER_FAILURE_THRESHOLD", 3),
+            render_circuit_open: Duration::from_secs(get_env_default("RENDER_CIRCUIT_OPEN_SECS", 30)),
             memory_capacity: get_env_default("TILE_MEMORY_CAPACITY", 4096),
             memory_ttl: Duration::from_secs(get_env_default("TILE_MEMORY_TTL_SECS", 600)),
             negative_ttl: Duration::from_secs(get_env_default("TILE_NEGATIVE_TTL_SECS", 60)),

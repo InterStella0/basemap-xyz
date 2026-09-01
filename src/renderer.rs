@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -29,6 +30,69 @@ pub enum RenderError {
     UnexpectedContentType(String),
     #[error("renderer returned an empty body")]
     EmptyBody,
+    /// The circuit breaker is open: recent renders failed at the transport level, so this attempt
+    /// failed fast without touching the network. The renderer may well be back; the breaker just
+    /// refuses to keep paying the full request timeout per tile until it is.
+    #[error("renderer is unreachable: circuit open")]
+    RendererDown,
+}
+
+impl RenderError {
+    /// Whether this failure means the renderer itself is unreachable, as opposed to the renderer
+    /// answering with a bad tile. Only the down class may trip the circuit breaker and must skip
+    /// the negative cache: a dead renderer should fail every miss fast, not once a minute.
+    pub fn is_renderer_down(&self) -> bool {
+        matches!(
+            self,
+            RenderError::Transport(_) | RenderError::Timeout(_) | RenderError::RendererDown
+        )
+    }
+}
+
+/// A tiny circuit breaker. Only transport-level failures count; any response at all proves the
+/// renderer is alive and resets everything.
+struct Breaker {
+    threshold: u32,
+    open_duration: Duration,
+    failures: AtomicU32,
+    open_until: Mutex<Option<Instant>>,
+}
+
+impl Breaker {
+    fn new(threshold: u32, open_duration: Duration) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            open_duration,
+            failures: AtomicU32::new(0),
+            open_until: Mutex::new(None),
+        }
+    }
+
+    /// Whether a render attempt is allowed right now.
+    fn allows(&self) -> bool {
+        match *self.open_until.lock().expect("breaker mutex poisoned") {
+            Some(until) if Instant::now() < until => false,
+            _ => true,
+        }
+    }
+
+    /// Records one transport failure; returns true when this failure opens the circuit.
+    fn record_failure(&self) -> bool {
+        let failures = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures >= self.threshold {
+            let mut open_until = self.open_until.lock().expect("breaker mutex poisoned");
+            *open_until = Some(Instant::now() + self.open_duration);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Any response from the renderer proves it is alive; clear all state.
+    fn record_success(&self) {
+        self.failures.store(0, Ordering::Relaxed);
+        *self.open_until.lock().expect("breaker mutex poisoned") = None;
+    }
 }
 
 pub struct Renderer {
@@ -40,14 +104,20 @@ pub struct Renderer {
     /// Resolved per request, not per coordinate: the routing table only ever affects the outbound
     /// WMTS `LAYER`, never the cache key, so it lives here rather than on `TileCoord`.
     routes: LayerRoutes,
+    /// Stops a dead renderer from costing one full `request_timeout` per tile: after
+    /// `failure_threshold` transport failures every miss fails fast until the circuit closes.
+    breaker: Breaker,
 }
 
 impl Renderer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_url: String,
         concurrency: usize,
         queue_timeout: Duration,
         request_timeout: Duration,
+        failure_threshold: u32,
+        circuit_open: Duration,
         metrics: Arc<Metrics>,
         routes: LayerRoutes,
     ) -> Self {
@@ -68,6 +138,7 @@ impl Renderer {
             queue_timeout,
             metrics,
             routes,
+            breaker: Breaker::new(failure_threshold, circuit_open),
         }
     }
 
@@ -85,6 +156,12 @@ impl Renderer {
     /// and letting more requests than that through just moves the queue somewhere we cannot
     /// observe or time out.
     pub async fn fetch(&self, coord: &TileCoord) -> Result<Bytes, RenderError> {
+        // Fail fast while the circuit is open: the caller turns this into a 503, and the state
+        // layer deliberately does not negative-cache it, so every miss keeps answering promptly.
+        if !self.breaker.allows() {
+            return Err(RenderError::RendererDown);
+        }
+
         let _permit = match tokio::time::timeout(self.queue_timeout, self.permits.acquire()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => unreachable!("the semaphore is never closed"),
@@ -103,12 +180,25 @@ impl Renderer {
             .send()
             .await
             .map_err(|err| {
-                if err.is_timeout() {
+                let failure = if err.is_timeout() {
                     RenderError::Timeout(started.elapsed())
                 } else {
                     RenderError::Transport(err.to_string())
+                };
+                if self.breaker.record_failure() {
+                    Metrics::bump(&self.metrics.circuit_opens);
+                    tracing::warn!(
+                        %coord,
+                        failures = self.breaker.threshold,
+                        "renderer transport failures reached threshold; circuit open"
+                    );
                 }
+                failure
             })?;
+
+        // The renderer answered something — a tile, an HTTP error, a ServiceException, anything.
+        // It is alive, so the breaker resets regardless of how the body is judged below.
+        self.breaker.record_success();
 
         let status = response.status();
         let content_type = response
@@ -148,6 +238,12 @@ impl Renderer {
     /// Cheap liveness probe for `/health`. Uses GetCapabilities rather than a tile so it stays
     /// meaningful even when the project publishes no layer at all.
     pub async fn probe(&self) -> Result<(), RenderError> {
+        // Respect the open circuit: the API's /health reports the renderer as down the moment the
+        // breaker trips, without paying a network round trip per poll.
+        if !self.breaker.allows() {
+            return Err(RenderError::RendererDown);
+        }
+
         let response = self
             .client
             .get(self.ows_url())
@@ -155,7 +251,15 @@ impl Renderer {
             .timeout(Duration::from_secs(5))
             .send()
             .await
-            .map_err(|err| RenderError::Transport(err.to_string()))?;
+            .map_err(|err| {
+                let failure = RenderError::Transport(err.to_string());
+                if self.breaker.record_failure() {
+                    Metrics::bump(&self.metrics.circuit_opens);
+                }
+                failure
+            })?;
+
+        self.breaker.record_success();
 
         if response.status().is_success() {
             Ok(())
@@ -193,6 +297,21 @@ fn summarise_exception(body: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Shared builder so a signature change in `Renderer::new` touches one line here instead of
+    /// every test.
+    fn renderer(base_url: &str, concurrency: usize, metrics: Arc<Metrics>) -> Renderer {
+        Renderer::new(
+            base_url.to_string(),
+            concurrency,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            2,
+            Duration::from_secs(60),
+            metrics,
+            LayerRoutes::default(),
+        )
+    }
+
     #[test]
     fn extracts_the_message_from_a_service_exception() {
         let body = br#"<?xml version="1.0"?>
@@ -217,11 +336,14 @@ mod tests {
 
     #[tokio::test]
     async fn queue_timeout_fires_when_every_permit_is_held() {
+        // A short queue timeout so the test does not wait the default second.
         let renderer = Renderer::new(
             "http://127.0.0.1:1".to_string(),
             1,
             Duration::from_millis(50),
             Duration::from_secs(1),
+            2,
+            Duration::from_secs(60),
             Arc::new(Metrics::default()),
             LayerRoutes::default(),
         );
@@ -235,17 +357,87 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_renderer_is_a_transport_error_not_a_panic() {
+        let renderer = renderer("http://127.0.0.1:1", 2, Arc::new(Metrics::default()));
+        assert!(renderer.fetch(&TileCoord::new("layer", 0, 0, 0)).await.is_err());
+        assert!(renderer.probe().await.is_err());
+    }
+
+    #[test]
+    fn breaker_opens_on_threshold_and_resets_on_any_response() {
+        let breaker = Breaker::new(2, Duration::from_secs(60));
+        assert!(breaker.allows());
+        assert!(!breaker.record_failure());
+        assert!(breaker.allows(), "one failure below threshold must not open the circuit");
+        assert!(breaker.record_failure());
+        assert!(!breaker.allows(), "two failures must open the circuit");
+        breaker.record_success();
+        assert!(breaker.allows(), "a response must reset the breaker");
+    }
+
+    #[tokio::test]
+    async fn transport_failures_open_the_circuit_and_fail_fast() {
+        let metrics = Arc::new(Metrics::default());
+        let renderer = renderer("http://127.0.0.1:1", 2, metrics.clone());
+
+        // Two transport failures trip the breaker...
+        for _ in 0..2 {
+            assert!(renderer.fetch(&TileCoord::new("layer", 0, 0, 0)).await.is_err());
+        }
+        assert_eq!(Metrics::get(&metrics.circuit_opens), 1);
+
+        // ...and further attempts fail fast with RendererDown, without touching the network.
+        let started = Instant::now();
+        let err = renderer.fetch(&TileCoord::new("layer", 0, 0, 1)).await.unwrap_err();
+        assert!(matches!(err, RenderError::RendererDown), "got {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "circuit-open fetch must fail fast, took {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(renderer.probe().await.unwrap_err(), RenderError::RendererDown));
+    }
+
+    /// An HTTP answer — even a failure status — is proof of life: it must reset the breaker, never
+    /// trip it. A tiny HTTP server answers every request with 500.
+    #[tokio::test]
+    async fn an_http_response_resets_the_breaker_instead_of_tripping_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .ok();
+                });
+            }
+        });
+
+        let metrics = Arc::new(Metrics::default());
+        // Threshold 1: a single transport failure would open the circuit. The 500 answers instead.
         let renderer = Renderer::new(
-            // Port 1 is reserved and refuses connections immediately.
-            "http://127.0.0.1:1".to_string(),
+            format!("http://{addr}"),
             2,
             Duration::from_secs(1),
             Duration::from_secs(2),
-            Arc::new(Metrics::default()),
+            1,
+            Duration::from_secs(60),
+            metrics.clone(),
             LayerRoutes::default(),
         );
-        assert!(renderer.fetch(&TileCoord::new("layer", 0, 0, 0)).await.is_err());
-        assert!(renderer.probe().await.is_err());
+
+        for _ in 0..3 {
+            let err = renderer.fetch(&TileCoord::new("layer", 0, 0, 0)).await.unwrap_err();
+            assert!(matches!(err, RenderError::Status(500)), "got {err:?}");
+        }
+        assert_eq!(Metrics::get(&metrics.circuit_opens), 0, "answers must never trip the breaker");
     }
 
     #[test]
@@ -256,6 +448,8 @@ mod tests {
                 1,
                 Duration::from_secs(1),
                 Duration::from_secs(1),
+                2,
+                Duration::from_secs(30),
                 Arc::new(Metrics::default()),
                 LayerRoutes::default(),
             )

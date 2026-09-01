@@ -85,7 +85,14 @@ impl AppState {
                     Err(err) => {
                         Metrics::bump(&metrics.render_errors);
                         tracing::warn!(%coord, error = %err, "render failed");
-                        negative.insert(coord, ()).await;
+                        // Only per-tile failures are negative-cached. A renderer-down failure must
+                        // not hold the door shut: while the service is unreachable every miss keeps
+                        // answering 503, and retries are cheap because the circuit breaker fails
+                        // them fast. Caching a dead renderer's errors would turn the 503 contract
+                        // into a mix of 502s depending on which request tripped the cache first.
+                        if !err.is_renderer_down() {
+                            negative.insert(coord, ()).await;
+                        }
                         return Err(TileFailure::Render(err));
                     }
                 };

@@ -16,6 +16,11 @@ pub struct Metrics {
     pub render_errors: AtomicU64,
     pub negative_hits: AtomicU64,
     pub queue_timeouts: AtomicU64,
+    /// Times the circuit breaker flipped open (renderer unreachable, failing fast).
+    pub circuit_opens: AtomicU64,
+    /// Misses answered 503 because the renderer itself is down (breaker open, transport error or
+    /// timeout) rather than because one tile failed.
+    pub renderer_unavailable: AtomicU64,
     pub render_millis_total: AtomicU64,
     /// Filled in by each janitor sweep; zero until the first one finishes.
     pub last_sweep_files: AtomicU64,
@@ -49,6 +54,8 @@ impl Metrics {
             "render_errors": Self::get(&self.render_errors),
             "negative_hits": Self::get(&self.negative_hits),
             "queue_timeouts": Self::get(&self.queue_timeouts),
+            "circuit_opens": Self::get(&self.circuit_opens),
+            "renderer_unavailable": Self::get(&self.renderer_unavailable),
             "avg_render_ms": if renders == 0 { None } else { Some(total_ms / renders) },
             "cache": {
                 "sweeps": Self::get(&self.sweeps),

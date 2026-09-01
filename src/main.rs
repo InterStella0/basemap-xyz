@@ -65,6 +65,8 @@ async fn run() {
         config.render_concurrency,
         config.render_queue_timeout,
         config.render_timeout,
+        config.render_failure_threshold,
+        config.render_circuit_open,
         metrics.clone(),
         config.layer_routes.clone(),
     ));
@@ -123,12 +125,16 @@ mod route_tests {
 
     /// A state whose renderer points at a closed port. Anything that reaches the renderer fails
     /// fast, which is exactly what the routing and validation tests want: a request that gets a
-    /// 502 provably went past validation, and a 404 provably did not.
+    /// 503 (renderer down) provably went past validation, and a 404 provably did not.
     fn test_state() -> AppState {
-        test_state_with_routes(config::LayerRoutes::default())
+        test_state_with_renderer("http://127.0.0.1:1".to_string(), config::LayerRoutes::default())
     }
 
     fn test_state_with_routes(layer_routes: config::LayerRoutes) -> AppState {
+        test_state_with_renderer("http://127.0.0.1:1".to_string(), layer_routes)
+    }
+
+    fn test_state_with_renderer(renderer_url: String, layer_routes: config::LayerRoutes) -> AppState {
         let dir = std::env::temp_dir().join(format!(
             "dark-basemap-routes-{}-{:?}",
             std::process::id(),
@@ -139,7 +145,7 @@ mod route_tests {
 
         let config = Arc::new(Config {
             port: 0,
-            renderer_url: "http://127.0.0.1:1".to_string(),
+            renderer_url,
             cache_dir: dir.clone(),
             tile_ttl: Duration::from_secs(120 * 86_400),
             sweep_interval: Duration::from_secs(3600),
@@ -149,6 +155,8 @@ mod route_tests {
             render_concurrency: 2,
             render_queue_timeout: Duration::from_millis(200),
             render_timeout: Duration::from_millis(500),
+            render_failure_threshold: 2,
+            render_circuit_open: Duration::from_secs(30),
             memory_capacity: 64,
             memory_ttl: Duration::from_secs(60),
             negative_ttl: Duration::from_secs(60),
@@ -162,6 +170,8 @@ mod route_tests {
             config.render_concurrency,
             config.render_queue_timeout,
             config.render_timeout,
+            config.render_failure_threshold,
+            config.render_circuit_open,
             metrics.clone(),
             config.layer_routes.clone(),
         ));
@@ -194,11 +204,91 @@ mod route_tests {
     }
 
     #[tokio::test]
-    async fn a_valid_coordinate_with_a_dead_renderer_is_502_and_uncacheable() {
+    async fn a_valid_coordinate_with_a_dead_renderer_is_503_and_uncacheable() {
         let cli = TestClient::new(build_app(test_state()));
         let resp = cli.get("/tiles/countries/9/271/171.png").send().await;
-        resp.assert_status(StatusCode::BAD_GATEWAY);
+        resp.assert_status(StatusCode::SERVICE_UNAVAILABLE);
         resp.assert_header("cache-control", "no-store");
+        resp.assert_header("retry-after", "30");
+    }
+
+    /// The renderer-down class must not be negative-cached: while the renderer is gone, every
+    /// miss answers 503, instead of the first request tripping the cache and the rest getting a
+    /// mixed 502. Retries stay cheap because the circuit breaker fails them fast.
+    #[tokio::test]
+    async fn a_dead_renderer_keeps_answering_503_instead_of_negative_caching() {
+        let state = test_state();
+        let cli = TestClient::new(build_app(state.clone()));
+
+        for _ in 0..2 {
+            cli.get("/tiles/countries/9/271/171.png")
+                .send()
+                .await
+                .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        assert_eq!(
+            Metrics::get(&state.metrics.render_errors),
+            2,
+            "down-class errors must not be negative-cached"
+        );
+        assert_eq!(Metrics::get(&state.metrics.renderer_unavailable), 2);
+    }
+
+    /// A fake QGIS Server that answers every request with a ServiceException document.
+    #[poem::handler]
+    async fn fake_qgis_service_exception() -> poem::Response {
+        poem::Response::builder()
+            .status(poem::http::StatusCode::OK)
+            .header("content-type", "text/xml")
+            .body(r#"<ServiceExceptionReport><ServiceException>Layer "nope" not found</ServiceException></ServiceExceptionReport>"#)
+    }
+
+    async fn fake_qgis() -> (String, tokio::task::JoinHandle<()>) {
+        use poem::listener::{Acceptor, Listener};
+        let listener = poem::listener::TcpListener::bind("127.0.0.1:0".to_string());
+        let acceptor = listener.into_acceptor().await.unwrap();
+        let local_addrs = acceptor.local_addr();
+        let addr = local_addrs[0].as_socket_addr().unwrap();
+        let app = poem::Route::new().at("/ows/", poem::get(fake_qgis_service_exception));
+        let handle = tokio::spawn(async move {
+            let _ = poem::Server::new_with_acceptor(acceptor)
+                .run_with_graceful_shutdown(app, std::future::pending::<()>(), None)
+                .await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Guards the split between the two failure classes: a tile the renderer *answered* badly is
+    /// negative-cached and stays a 502, while a renderer that is simply gone is a 503.
+    #[tokio::test]
+    async fn a_service_exception_is_negative_cached_and_stays_a_502() {
+        let (renderer_url, _server) = fake_qgis().await;
+        let state = test_state_with_renderer(renderer_url, config::LayerRoutes::default());
+        let cli = TestClient::new(build_app(state.clone()));
+
+        for _ in 0..2 {
+            cli.get("/tiles/countries/9/271/171.png")
+                .send()
+                .await
+                .assert_status(StatusCode::BAD_GATEWAY);
+        }
+
+        assert_eq!(
+            Metrics::get(&state.metrics.render_errors),
+            1,
+            "a broken tile must be negative-cached"
+        );
+        assert_eq!(
+            Metrics::get(&state.metrics.renderer_unavailable),
+            0,
+            "an answered request is not renderer-down"
+        );
+        assert_eq!(
+            Metrics::get(&state.metrics.circuit_opens),
+            0,
+            "an answered request must not trip the breaker"
+        );
     }
 
     #[tokio::test]

@@ -39,7 +39,7 @@ pub async fn get_tile(
             .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
             .header("X-Tile-Cache", "MISS")
             .body(Body::from_bytes(bytes)),
-        Err(failure) => error_response(&failure),
+        Err(failure) => error_response(&failure, &state.metrics),
     }
 }
 
@@ -61,10 +61,18 @@ fn not_found(message: &str) -> Response {
     response
 }
 
-fn error_response(failure: &TileFailure) -> Response {
+fn error_response(failure: &TileFailure, metrics: &Metrics) -> Response {
     let (status, retry_after) = match failure {
         // Backpressure, not breakage: every render slot is busy. Tell the client to come back.
         TileFailure::Render(RenderError::QueueTimeout(_)) => (StatusCode::SERVICE_UNAVAILABLE, Some(5)),
+        // The renderer itself is unreachable, or the circuit breaker has declared it down. A 503
+        // tells clients the tile may exist later; the breaker makes these answers fast and the
+        // negative cache deliberately does not suppress them, so the contract holds for every
+        // miss while the renderer is gone.
+        TileFailure::Render(err) if err.is_renderer_down() => {
+            Metrics::bump(&metrics.renderer_unavailable);
+            (StatusCode::SERVICE_UNAVAILABLE, Some(30))
+        }
         TileFailure::RecentlyFailed => (StatusCode::BAD_GATEWAY, Some(30)),
         TileFailure::Render(_) => (StatusCode::BAD_GATEWAY, Some(10)),
     };
