@@ -98,10 +98,10 @@ cannot span nodes, so there is no other way for it to touch that disk.
 Internet
   └─ VPS (manager, basemap.role=frontend)
        └─ reverse (nginx :80, published :8080 mode=host)
-              └─ API_HOST=http://<home-box-tailscale-ip>:3000 ──┐
+              └─ API_HOST=<home-box-tailscale-ip>, API_PORT=3045 ──┐
                                                                 │ Tailscale (not the overlay)
   home box (worker, basemap.role=renderer)                      │
-       ├─ api (published :3000 mode=host) ◄─────────────────────┘
+       ├─ api (published :3045 → container :3000 mode=host) ◄─────────────────────┘
        │     ├─ /mnt/meow/OSM/tiles → /var/cache/tiles (SSD tile store, rw)
        │     └─ RENDERER_URL=http://renderer (overlay, same node)
        └─ renderer (QGIS, published :8081 mode=host)
@@ -130,7 +130,7 @@ that is the accepted tradeoff for keeping the tiles on the SSD. `scripts/pregene
    docker node update --label-add basemap.role=frontend <vps-node>
    docker node update --label-add basemap.role=renderer <home-node>
    ```
-3. Make sure the Tailscale ACL lets the VPS reach the home box on tcp/3000 (`API_PUBLISH_PORT`)
+3. Make sure the Tailscale ACL lets the VPS reach the home box on tcp/3045 (`API_PUBLISH_PORT`)
    for the api; tcp/8081 (`RENDERER_PUBLISH_PORT`) is only needed if you also want to reach the
    renderer directly from the VPS.
 4. `/mnt/meow` is a fuseblk (NTFS via FUSE) mount owned by uid 1000, so the api service runs as
@@ -140,7 +140,7 @@ that is the accepted tradeoff for keeping the tiles on the SSD. `scripts/pregene
 **Every deploy:**
 
 1. Push the images (`docker stack deploy` does not build): `scripts/push-swarm-images.sh`.
-2. Set `SWARM_API_HOST=http://<home-box-tailscale-ip>` in `.env`, copy that `.env` next to
+2. Set `SWARM_API_HOST=<home-box-tailscale-ip>` in `.env`, copy that `.env` next to
    `compose.swarm.yaml` on the VPS (`env_file` and `${...}` interpolation are both read from
    the manager at deploy time), then:
    ```sh
