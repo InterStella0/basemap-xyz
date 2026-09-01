@@ -23,4 +23,4 @@ docker push interstella0/dark-basemap:renderer
 
 echo
 echo "Done. On the manager (VPS), with .env present:"
-echo "  docker stack deploy -c compose.swarm.yaml dark-basemap"
+echo "  scripts/deploy-swarm.sh"
