@@ -29,7 +29,7 @@ services:
         condition: any
       resources:
         limits:
-          cpus: '2'
+          cpus: '1'
           memory: 512M
         reservations:
           cpus: '0.25'
@@ -69,7 +69,7 @@ services:
         condition: any
       resources:
         limits:
-          cpus: '2'
+          cpus: '1'
           memory: 1G
         reservations:
           cpus: '0.25'
