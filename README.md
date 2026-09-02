@@ -77,8 +77,9 @@ render finishes. The API handles that with:
    then refills it from the old cartography still baked into the running image.
 2. **Configure.** `cp default.env .env` and fill in `BASEMAP_PUBLIC_URL` and the `DB_*` values.
 3. **Run.** `docker compose up -d --build`
-4. **(Optional) Add OSM detail.** `scripts/build-osm-detail.sh` then
-   `scripts/patch-project.py --detail` — see [Zoom-tiered detail](#zoom-tiered-detail).
+4. **(Optional) Add OSM detail.** `scripts/load-natural-earth-states.sh`, then
+   `scripts/build-osm-detail.sh`, then `scripts/patch-project.py --base --detail` — see
+   [Zoom-tiered detail](#zoom-tiered-detail) and [Labels](#labels).
 
 The site and tiles are then on `${EXPOSE_PORT}` (8080 by default).
 
@@ -239,11 +240,11 @@ from `countries`, a group of OpenStreetMap layers in GeoPackages. Clients never 
 `TILE_LAYER_ROUTES` in `.env` is the switch:
 
 ```
-TILE_LAYER_ROUTES=countries@0-5=simple-countries
+TILE_LAYER_ROUTES=countries@0-3=simple-countries
 ```
 
 Comma-separated `<public>@<lo>-<hi>=<upstream>`; first match wins, and any layer or zoom without a
-rule renders from its own name. So the line above sends z0–5 to `simple-countries` and leaves z6–20
+rule renders from its own name. So the line above sends z0–3 to `simple-countries` and leaves z4–20
 on `countries`. A malformed rule is a boot panic, not a silent fallback.
 
 The tile is always cached under the **public** name, so `/tiles/countries/9/271/171.png` lives at
@@ -258,11 +259,16 @@ index, so a bbox query decompresses and scans the whole file. Measured on this d
 A GeoPackage is also just a file, but it carries an R-tree, so the same query is milliseconds.
 
 ```sh
-scripts/build-osm-detail.sh              # .osm.pbf -> GeoPackages (hours; resumable)
-python3 scripts/patch-project.py --detail  # add the layers to project.qgz
+scripts/load-natural-earth-states.sh          # Natural Earth admin-1 -> PostGIS public.states
+scripts/build-osm-detail.sh                   # .osm.pbf -> GeoPackages (hours; resumable)
+python3 scripts/patch-project.py --base --detail   # add the layers and labels to project.qgz
 scripts/sync-project-version.sh
 docker compose up -d --build renderer
 ```
+
+`patch-project.py --detail` refuses to write the project if a PostGIS table a layer needs is
+missing, because a bad PostGIS layer under `QGIS_SERVER_IGNORE_BAD_LAYERS=0` fails the whole project
+at load time — every tile 500s, with the reason only in the renderer's log.
 
 The script reads every `*.osm.pbf` in `/mnt/meow/OSM` and writes one GeoPackage per theme into
 `$OSM_DETAIL_DIR`, which `compose.yaml` mounts read-only at `/data` in the renderer. It records
@@ -280,8 +286,14 @@ Measured on the full planet (all 8 Geofabrik continent extracts, 79 GB of `.osm.
 | `landuse` | 73,362,104 | 30 GB |
 | `water` | 23,699,230 | 8.5 GB |
 | `roads` | ~29,000,000 | 6.0 GB |
+| `places` | ~1,700,000 | ~250 MB |
 | `countries` (unused, see below) | 375 | 31 MB |
-| **total** | | **44.5 GB** |
+| **total** | | **~44.8 GB** |
+
+`places` is the outlier in that table: it took **minutes**, not hours. It comes from the `points`
+layer, which is plain tagged nodes, so GDAL never builds the node-reference index that dominates
+every other pass. Measured on the 752 MB central-america extract, a full scan of `points` is 4.2 s
+against 64 s for the same file's `multipolygons`.
 
 A tile-sized bbox query against the 30 GB `landuse` file returns in **~40 ms**. The same query
 against the raw `.osm.pbf` would take ~28 minutes; that difference is the entire reason this
@@ -311,6 +323,70 @@ is still built and left in place; nothing references it.
 `patch-project.py` skips any theme whose GeoPackage is absent, so a run without buildings produces a
 working project rather than a broken one — QGIS Server runs with `QGIS_SERVER_IGNORE_BAD_LAYERS=0`,
 where one missing file would otherwise take down the whole project.
+
+## Labels
+
+Text comes from two sources, chosen per label rather than per zoom.
+
+**Names of places that have a fixed identity** — countries and states — come from Natural Earth in
+PostGIS. That is the same data the land base is drawn from, so the label agrees with the shape under
+it, and because it is a small indexed table it can be queried at *every* zoom, including z0–3 where
+the OSM detail group is not even loaded. `simple-countries` therefore carries country labels of its
+own: the low-zoom layer is not a fallback that loses the names, it is where the names come from.
+
+**Names of things you only care about up close** — cities, towns, villages, lakes and bays — come
+from OpenStreetMap, and switch on as you zoom in.
+
+| Layer | Source | Zooms | Notes |
+|---|---|---|---|
+| `simple-countries` | PostGIS `countries` | z0–3 | The low-zoom route; carries the same country labels as below |
+| `country-labels` | PostGIS `countries` | z4–9 | Uppercase, letter-spaced |
+| `states` | PostGIS `states` | z4+ | Dashed boundary line, no label |
+| `state-labels-major` | PostGIS `states` | z5–11 | `labelrank <= 4` — the ~800 units Natural Earth ranks worth a world-map name |
+| `state-labels` | PostGIS `states` | z7–11 | `labelrank` 5–19; 20 is Natural Earth's "never label this" bucket |
+| `places-metro` | `places.gpkg` | z4+ | `place=city`, population ≥ 1M — 652 worldwide |
+| `places-city` | `places.gpkg` | z6+ | population 200k–1M |
+| `places-city-minor` | `places.gpkg` | z8+ | the remaining cities, including the 1,819 with no population tag |
+| `places-town` | `places.gpkg` | z9+ | `town`, `borough`; smaller dot |
+| `places-village` | `places.gpkg` | z12+ | `village`, `suburb`; name only, no dot |
+| `water-labels` | `water.gpkg` | z6+ | Italic, `name IS NOT NULL` |
+
+Cities are tiered because `place=city` alone is 11,906 points and all of them on one z5 tile buries
+the continent. OSM's `population` is free text and often absent, so it is `CAST` and `coalesce`d to
+0: a city with no population lands in the bottom tier, which is the safe direction to be wrong in.
+Country and state labels stop at z9 and z11 — a country name is orientation at z6 and noise at z12,
+where you can already see the streets it is sitting on.
+
+Three mechanisms do the work, and all three matter:
+
+- **`centroidWhole="1"`** on every polygon label. Without it QGIS anchors a polygon's label at the
+  centroid of the part visible in the current request extent — and every 256×256 `GetTile` *is* its
+  own extent, so "France" would be redrawn in every tile France touches. With it the anchor is the
+  whole geometry's centroid and the name is drawn once.
+- **`minFeatureSize`**, in mm. A country too small to be worth 6 mm on screen loses its label until
+  you zoom in far enough. This stages the whole set by zoom for free, so `country-labels` is one
+  layer rather than one per importance tier.
+- **A datasource subset per layer.** `places-city` and `places-town` read the same GeoPackage
+  through different `subset=` filters, so each slice gets its own `min_z`. The filter runs in the
+  GeoPackage's own SQLite (or in PostGIS), so it costs an index lookup, not a scan.
+
+Place labels prefer the `name:en` tag where mappers supplied one and fall back to the local-script
+`name`. The renderer image installs DejaVu and Noto (including CJK) for the rest; without them every
+non-Latin name renders as a row of tofu boxes.
+
+### The seam
+
+QGIS Server renders each tile independently, so a label whose text crosses a tile boundary is
+clipped at the edge. `centroidWhole` fixes the far worse artifact — the same name repeating in every
+tile — but not this one. Fixing it properly means metatiling: rendering a 3×3 block in one `GetMap`
+and slicing it, which reshapes the cache and single-flight path in `src/renderer.rs` and
+`src/routers/tiles.rs`. Not done; noted.
+
+### What is not labelled
+
+Road names. `scripts/build-osm-detail.sh` extracted `roads.gpkg` with only the `highway` column, so
+adding them means re-running the whole 6 GB `lines` pass with `name` and `ref` — hours, and a job of
+its own.
 
 ## Cache behaviour
 
@@ -384,9 +460,11 @@ Two different things, two different licenses:
 
 ## Attribution
 
-The cartography is mine; the geometry is OpenStreetMap, licensed
-[ODbL](https://opendatacommons.org/licenses/odbl/). Rendered tiles are a Produced Work, so the
-credit has to be visible wherever the map is
+The cartography is mine. The detail geometry and every place, town and water body name are
+OpenStreetMap, licensed [ODbL](https://opendatacommons.org/licenses/odbl/); the land base, the
+state boundaries and the country and state names are [Natural Earth](https://www.naturalearthdata.com/),
+which is public domain and asks for no credit. Rendered tiles are a Produced Work, so the OSM credit
+has to be visible wherever the map is
 
 ```html
 &copy; <a href="https://basemap.queeniemella.cc">queeniemella</a>

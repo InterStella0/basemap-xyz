@@ -9,17 +9,22 @@ Two phases, because the detail layers cannot exist before their data does — QG
 QGIS_SERVER_IGNORE_BAD_LAYERS=0, so a layer pointing at a missing GeoPackage takes down the whole
 project, not just that layer.
 
-  --base     (always safe) rename `countries` -> `simple-countries`, and extend the WMTS pyramid
-             from z0-16 to z0-20 so MAX_ZOOM=20 in .env is actually served.
-  --detail   add the OSM detail layers as a group published under the single WMTS name `countries`.
-             Requires the GeoPackages from scripts/build-osm-detail.sh to exist.
+  --base     (always safe) rename `countries` -> `simple-countries`, put country labels on it so
+             the z0-3 route is not a silent map, and extend the WMTS pyramid from z0-16 to z0-20 so
+             MAX_ZOOM=20 in .env is actually served.
+  --detail   add the OSM detail layers, the Natural Earth state boundaries and every label layer as
+             a group published under the single WMTS name `countries`. Requires the GeoPackages from
+             scripts/build-osm-detail.sh and the PostGIS tables from
+             scripts/load-natural-earth-states.sh to exist.
 
 Run scripts/sync-project-version.sh afterwards to flush the tile cache.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import subprocess
 import sys
 import uuid
 import xml.etree.ElementTree as ET
@@ -108,7 +113,18 @@ def symbol(kind: str, name: str, layers: list[ET.Element]) -> ET.Element:
     return s
 
 
-def fill_layer(fill: str, stroke: str | None, stroke_width: float) -> ET.Element:
+def fill_layer(
+    fill: str,
+    stroke: str | None,
+    stroke_width: float,
+    *,
+    style: str = "solid",
+    alpha: int = 255,
+    outline_style: str = "solid",
+) -> ET.Element:
+    """A SimpleFill. `style="no"` gives an outline-only polygon (the states boundary), and
+    `style="no"` with no stroke gives a polygon that draws nothing at all — which is what a
+    label-only layer needs, since a maplayer must still carry a renderer."""
     e = ET.Element(
         "layer",
         {"class": "SimpleFill", "enabled": "1", "id": uid(), "locked": "0", "pass": "0"},
@@ -116,20 +132,65 @@ def fill_layer(fill: str, stroke: str | None, stroke_width: float) -> ET.Element
     e.append(
         opt_map(
             border_width_map_unit_scale="3x:0,0,0,0,0,0",
-            color=colour(fill),
+            color=colour(fill, alpha),
             joinstyle="bevel",
             offset="0,0",
             offset_map_unit_scale="3x:0,0,0,0,0,0",
             offset_unit="MM",
             outline_color=colour(stroke) if stroke else colour("#000000", 0),
-            outline_style="solid" if stroke else "no",
+            outline_style=outline_style if stroke else "no",
             outline_width=str(stroke_width),
             outline_width_unit="MM",
-            style="solid",
+            style=style,
         )
     )
     e.append(ddp())
     return e
+
+
+def marker_layer(fill: str, size: float, *, alpha: int = 255) -> ET.Element:
+    """A plain filled circle. Places get a small dot so the name has something to belong to; a
+    label floating in empty space reads as a typo rather than a town."""
+    e = ET.Element(
+        "layer",
+        {"class": "SimpleMarker", "enabled": "1", "id": uid(), "locked": "0", "pass": "0"},
+    )
+    e.append(
+        opt_map(
+            angle="0",
+            cap_style="square",
+            color=colour(fill, alpha),
+            horizontal_anchor_point="1",
+            joinstyle="bevel",
+            name="circle",
+            offset="0,0",
+            offset_map_unit_scale="3x:0,0,0,0,0,0",
+            offset_unit="MM",
+            outline_color=colour("#000000", 0),
+            outline_style="no",
+            outline_width="0",
+            outline_width_map_unit_scale="3x:0,0,0,0,0,0",
+            outline_width_unit="MM",
+            scale_method="diameter",
+            size=str(size),
+            size_map_unit_scale="3x:0,0,0,0,0,0",
+            size_unit="MM",
+            vertical_anchor_point="1",
+        )
+    )
+    e.append(ddp())
+    return e
+
+
+def invisible_renderer(kind: str) -> ET.Element:
+    """A renderer that draws nothing. Label-only layers still need one — QGIS will not load a
+    vector maplayer without a <renderer-v2> — so they get a symbol with every stroke and fill
+    switched off."""
+    if kind == "marker":
+        layer = marker_layer("#000000", 0, alpha=0)
+    else:
+        layer = fill_layer("#000000", None, 0, style="no", alpha=0)
+    return single_renderer(symbol(kind, "0", [layer]))
 
 
 def line_layer(stroke: str, width: float) -> ET.Element:
@@ -222,12 +283,426 @@ def rule_renderer(rules: list[dict]) -> ET.Element:
     return r
 
 
+# --- labelling -------------------------------------------------------------------------------------
+# QGIS keeps label settings in a <labeling> element on the maplayer, parallel to <renderer-v2>. The
+# attribute names below are copied verbatim from a project QGIS 4.2 wrote itself
+# (/usr/share/qgis/resources/data/qgis-hackfests.qml); QGIS silently falls back to defaults for a
+# <settings> block it cannot parse, so an invented attribute name shows up as "the labels are wrong"
+# rather than as an error.
+
+
+def plain_colour(hex_rgb: str, alpha: int = 255) -> str:
+    """'#cfcfcf' -> '207,207,207,255'. Text colours use this short form, not `colour()`'s."""
+    h = hex_rgb.lstrip("#")
+    r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+    return f"{r},{g},{b},{alpha}"
+
+
+def labeling(spec: dict, geometry: str) -> ET.Element:
+    """<labeling type="simple"> from a theme's `label` dict.
+
+    Only simple labelling is emitted. Zoom staging is done by splitting a source across several map
+    layers with a datasource subset and per-layer `minScale`, which is the mechanism the renderers
+    here already rely on — rather than by hand-writing rule-based-labelling XML, which is a second
+    schema to get right for no extra capability.
+    """
+    lab = ET.Element("labeling", {"type": "simple"})
+    settings = ET.SubElement(lab, "settings")
+
+    style = ET.SubElement(
+        settings,
+        "text-style",
+        {
+            "allowHtml": "0",
+            "blendMode": "0",
+            "capitalization": str(spec.get("capitalization", 0)),
+            "fieldName": spec["field"],
+            "fontFamily": spec.get("family", "DejaVu Sans"),
+            "fontItalic": "1" if spec.get("italic") else "0",
+            "fontKerning": "1",
+            "fontLetterSpacing": str(spec.get("letter_spacing", 0)),
+            "fontSize": str(spec["size"]),
+            "fontSizeMapUnitScale": "3x:0,0,0,0,0,0",
+            "fontSizeUnit": "Point",
+            "fontStrikeout": "0",
+            "fontUnderline": "0",
+            "fontWeight": "75" if spec.get("bold") else "50",
+            "fontWordSpacing": "0",
+            "forcedBold": "0",
+            "forcedItalic": "0",
+            "isExpression": "1",
+            "legendString": "Aa",
+            "multilineHeight": "1",
+            "multilineHeightUnit": "Percentage",
+            "namedStyle": "Bold" if spec.get("bold") else "Regular",
+            "previewBkgrdColor": "0,0,0,255",
+            "textColor": plain_colour(spec["colour"]),
+            "textOpacity": "1",
+            "textOrientation": "horizontal",
+            "useSubstitutions": "0",
+        },
+    )
+    ET.SubElement(style, "families")
+    # The halo. Everything here is drawn on near-black, but text also crosses roads, water and
+    # landuse fills; without a buffer the thin strokes read as noise through the glyphs. Semi-opaque
+    # rather than solid so it darkens what is under it instead of punching a hole in the map.
+    ET.SubElement(
+        style,
+        "text-buffer",
+        {
+            "bufferBlendMode": "0",
+            "bufferColor": plain_colour(spec.get("halo", "#000000"), spec.get("halo_alpha", 190)),
+            "bufferDraw": "1",
+            "bufferJoinStyle": "128",
+            "bufferNoFill": "1",
+            "bufferOpacity": "1",
+            "bufferSize": str(spec.get("halo_size", 0.8)),
+            "bufferSizeMapUnitScale": "3x:0,0,0,0,0,0",
+            "bufferSizeUnits": "MM",
+        },
+    )
+    ET.SubElement(
+        style,
+        "text-mask",
+        {
+            "maskEnabled": "0",
+            "maskJoinStyle": "128",
+            "maskOpacity": "1",
+            "maskSize": "0",
+            "maskSizeMapUnitScale": "3x:0,0,0,0,0,0",
+            "maskSizeUnits": "MM",
+            "maskType": "0",
+            "maskedSymbolLayers": "",
+        },
+    )
+    ET.SubElement(style, "background", {"shapeDraw": "0", "shapeType": "0"})
+    ET.SubElement(style, "shadow", {"shadowDraw": "0"})
+    style.append(ddp())
+    ET.SubElement(style, "substitutions")
+
+    ET.SubElement(
+        settings,
+        "text-format",
+        {
+            "addDirectionSymbol": "0",
+            "autoWrapLength": "0",
+            "decimals": "3",
+            "formatNumbers": "0",
+            "leftDirectionSymbol": "<",
+            "multilineAlign": "3",
+            "placeDirectionSymbol": "0",
+            "plussign": "0",
+            "reverseDirectionSymbol": "0",
+            "rightDirectionSymbol": ">",
+            "useMaxLineLengthForAutoWrap": "1",
+            "wrapChar": "",
+        },
+    )
+
+    layer_type = {"Polygon": "PolygonGeometry", "Line": "LineGeometry"}.get(geometry, "PointGeometry")
+    ET.SubElement(
+        settings,
+        "placement",
+        {
+            "allowDegraded": "0",
+            "centroidInside": "1",
+            # THE load-bearing attribute for a tiled basemap. With centroidWhole="0" QGIS anchors a
+            # polygon's label at the centroid of the part of it visible in the request extent — and
+            # every 256x256 GetTile is its own extent, so a country gets relabelled in every single
+            # tile it touches. "1" anchors on the whole geometry, so the label is drawn once, in the
+            # tile that actually contains the centroid.
+            "centroidWhole": "1",
+            "dist": "0",
+            "distMapUnitScale": "3x:0,0,0,0,0,0",
+            "distUnits": "MM",
+            "fitInPolygonOnly": "0",
+            "geometryGenerator": "",
+            "geometryGeneratorEnabled": "0",
+            "geometryGeneratorType": "PointGeometry",
+            "labelOffsetMapUnitScale": "3x:0,0,0,0,0,0",
+            "lineAnchorClipping": "0",
+            "lineAnchorPercent": "0.5",
+            "lineAnchorTextPoint": "CenterOfText",
+            "lineAnchorType": "0",
+            "maxCurvedCharAngleIn": "25",
+            "maxCurvedCharAngleOut": "-25",
+            "offsetType": "0",
+            "offsetUnits": "MM",
+            "overlapHandling": "PreventOverlap",
+            "overrunDistance": "0",
+            "overrunDistanceMapUnitScale": "3x:0,0,0,0,0,0",
+            "overrunDistanceUnit": "MM",
+            # OverPoint: centred on the anchor. Points have no dot to dodge (places-city draws a
+            # small one, and the halo keeps the text legible over it), polygons want the name in
+            # the middle of the shape.
+            "placement": "1",
+            "placementFlags": "10",
+            "layerType": layer_type,
+            "polygonPlacementFlags": "2",
+            "predefinedPositionOrder": "TR,TL,BR,BL,R,L,TSR,BSR",
+            "preserveRotation": "1",
+            # Higher wins a collision. Country names should survive a clash with a village.
+            "priority": str(spec.get("priority", 5)),
+            "quadOffset": "4",
+            "repeatDistance": "0",
+            "repeatDistanceMapUnitScale": "3x:0,0,0,0,0,0",
+            "repeatDistanceUnits": "MM",
+            "rotationAngle": "0",
+            "rotationUnit": "AngleDegrees",
+            "xOffset": "0",
+            "yOffset": "0",
+        },
+    )
+
+    ET.SubElement(
+        settings,
+        "rendering",
+        {
+            "drawLabels": "1",
+            "fontLimitPixelSize": "0",
+            "fontMaxPixelSize": "10000",
+            "fontMinPixelSize": "3",
+            # One label per multipolygon, not one per island. Without this every Indonesian island
+            # and every Alaskan islet gets its own "Indonesia".
+            "labelPerPart": "0",
+            "limitNumLabels": "0",
+            "maxNumLabels": "2000",
+            "mergeLines": "0",
+            # Suppresses the label when the feature itself is smaller than this on screen, in mm.
+            # This is the zoom staging for polygon labels and it is free: Luxembourg drops out at
+            # z4 and comes back at z6 without a second layer or a scale rule.
+            "minFeatureSize": str(spec.get("min_feature_mm", 0)),
+            "obstacle": "1",
+            "obstacleFactor": "1",
+            "obstacleType": "0",
+            "scaleMax": "0",
+            "scaleMin": "0",
+            "scaleVisibility": "0",
+            "unplacedVisibility": "0",
+            "upsidedownLabels": "0",
+            "zIndex": "0",
+        },
+    )
+    settings.append(ddp("dd_properties"))
+    return lab
+
+
 # --- the detail themes ----------------------------------------------------------------------------
 # Colours extend the established theme: land #0f0f0f on a black canvas with a white border. Water
 # reads as a hole punched in the land, landuse as a barely-there lift, buildings one step above land,
-# roads the only bright thing. min_z is the XYZ zoom the layer starts drawing at; below it QGIS does
-# not even query the GeoPackage, which is the entire point of the exercise.
+# roads the only bright thing, and label text the one thing brighter still. min_z is the XYZ zoom the
+# layer starts drawing at; below it QGIS does not even query the GeoPackage, which is the entire
+# point of the exercise.
+#
+# Order is draw order, top first: label-only layers, then boundaries, then roads, then the fills, and
+# `land-base` at the bottom holding everything up. Labels are placed in a pass of their own after all
+# geometry, so their position here decides which name wins a collision, not what is drawn over what.
+#
+# A theme is label-only when its renderer is `invisible_renderer` — QGIS will not load a vector layer
+# without a renderer, so a layer that exists purely to carry text still has to declare one that draws
+# nothing.
+COUNTRY_LABEL = {
+    "field": '"NAME"',
+    "colour": "#d2d2d2",
+    "size": 10,
+    # Uppercase and letter-spaced: the convention that says "country" without needing a legend, and
+    # it keeps country names from reading as just another big city.
+    "capitalization": 1,
+    "letter_spacing": 1.4,
+    "halo_size": 1.0,
+    "priority": 9,
+    # In mm. A country too small to be worth 6 mm on screen loses its label until you zoom in far
+    # enough, which stages the whole set by zoom without a single extra layer or scale rule.
+    "min_feature_mm": 6,
+}
+
+STATE_LABEL = {
+    "field": '"name"',
+    "colour": "#8a8a8a",
+    "size": 8,
+    "halo_size": 0.8,
+    "priority": 6,
+    "min_feature_mm": 8,
+}
+
+def city_band(lo: int | None = None, hi: int | None = None) -> str:
+    """A `place=city` subset for one population band, half-open: `lo <= population < hi`.
+
+    `population` is an OSM free-text tag, so it is cast and coalesced: a non-numeric value casts to
+    0 in SQLite and a missing one becomes 0, which puts both in the *smallest* band rather than
+    dropping them off the map. Bands are exclusive, so no city is labelled twice once two of the
+    tiers are visible at the same zoom.
+    """
+    pop = "coalesce(CAST(population AS INTEGER), 0)"
+    clauses = ["place = 'city'"]
+    if lo is not None:
+        clauses.append(f"{pop} >= {lo}")
+    if hi is not None:
+        clauses.append(f"{pop} < {hi}")
+    return " AND ".join(clauses)
+
 THEMES = [
+    {
+        "name": "country-labels",
+        "pg_table": "countries",
+        "geometry": "Polygon",
+        "wkb": "MultiPolygon",
+        "min_z": None,
+        "max_z": 9,
+        "renderer": lambda: invisible_renderer("fill"),
+        "label": COUNTRY_LABEL,
+    },
+    # Natural Earth ranks its own admin-1 units, so the tiers are its judgement, not a guess:
+    # labelrank <= 4 is the ~800 units it considers worth a name on a world map, and 20 is the dump
+    # for units it does not consider labellable at any scale, so those never appear at all.
+    {
+        "name": "state-labels-major",
+        "pg_table": "states",
+        "geometry": "Polygon",
+        "wkb": "MultiPolygon",
+        "subset": '"labelrank" <= 4',
+        "min_z": 5,
+        "max_z": 11,
+        "renderer": lambda: invisible_renderer("fill"),
+        "label": STATE_LABEL,
+    },
+    {
+        "name": "state-labels",
+        "pg_table": "states",
+        "geometry": "Polygon",
+        "wkb": "MultiPolygon",
+        "subset": '"labelrank" > 4 AND "labelrank" < 20',
+        "min_z": 7,
+        "max_z": 11,
+        "renderer": lambda: invisible_renderer("fill"),
+        "label": STATE_LABEL,
+    },
+    # Cities in three tiers by population, because `place=city` alone is 11,906 points worldwide and
+    # putting all of them on a z5 tile buries the continent. See city_band() for how the bands
+    # handle OSM's unreliable population tag.
+    {
+        "name": "places-metro",
+        "gpkg": "places",
+        "geometry": "Point",
+        "wkb": "Point",
+        "subset": city_band(lo=1_000_000),
+        "min_z": 4,
+        # Cities keep a dot. The name alone floating over a dark field reads as a caption for
+        # nothing; the dot is what makes it a place.
+        "renderer": lambda: single_renderer(symbol("marker", "0", [marker_layer("#7a7a7a", 1.3)])),
+        "label": {
+            # OSM `name` is in the local script. name_en, where the mappers supplied it, keeps this
+            # basemap readable to its English-speaking audience and sidesteps most missing glyphs.
+            "field": 'coalesce("name_en", "name")',
+            "colour": "#ededed",
+            "size": 10,
+            "halo_size": 1.0,
+            "priority": 8,
+        },
+    },
+    {
+        "name": "places-city",
+        "gpkg": "places",
+        "geometry": "Point",
+        "wkb": "Point",
+        "subset": city_band(lo=200_000, hi=1_000_000),
+        "min_z": 6,
+        "renderer": lambda: single_renderer(symbol("marker", "0", [marker_layer("#6f6f6f", 1.1)])),
+        "label": {
+            "field": 'coalesce("name_en", "name")',
+            "colour": "#e6e6e6",
+            "size": 9,
+            "halo_size": 0.9,
+            "priority": 7,
+        },
+    },
+    {
+        "name": "places-city-minor",
+        "gpkg": "places",
+        "geometry": "Point",
+        "wkb": "Point",
+        "subset": city_band(hi=200_000),
+        "min_z": 8,
+        "renderer": lambda: single_renderer(symbol("marker", "0", [marker_layer("#636363", 1.0)])),
+        "label": {
+            "field": 'coalesce("name_en", "name")',
+            "colour": "#d8d8d8",
+            "size": 8.5,
+            "halo_size": 0.9,
+            "priority": 7,
+        },
+    },
+    {
+        "name": "places-town",
+        "gpkg": "places",
+        "geometry": "Point",
+        "wkb": "Point",
+        "subset": "place IN ('town', 'borough')",
+        "min_z": 9,
+        "renderer": lambda: single_renderer(symbol("marker", "0", [marker_layer("#575757", 0.8)])),
+        "label": {
+            "field": 'coalesce("name_en", "name")',
+            "colour": "#b4b4b4",
+            "size": 8,
+            "halo_size": 0.8,
+            "priority": 6,
+        },
+    },
+    {
+        "name": "places-village",
+        "gpkg": "places",
+        "geometry": "Point",
+        "wkb": "Point",
+        "subset": "place IN ('village', 'suburb')",
+        "min_z": 12,
+        "renderer": lambda: invisible_renderer("marker"),
+        "label": {
+            "field": 'coalesce("name_en", "name")',
+            "colour": "#8f8f8f",
+            "size": 7.5,
+            "halo_size": 0.7,
+            "priority": 3,
+        },
+    },
+    {
+        "name": "water-labels",
+        "gpkg": "water",
+        "geometry": "Polygon",
+        "wkb": "MultiPolygon",
+        # water.gpkg already carries `name` — scripts/build-osm-detail.sh selected it into the
+        # staging file — so lake and bay names cost no rebuild. The subset is what keeps this from
+        # being a scan of an 8.5 GB layer: the overwhelming majority of water polygons are unnamed.
+        "subset": "name IS NOT NULL",
+        "min_z": 6,
+        "renderer": lambda: invisible_renderer("fill"),
+        "label": {
+            "field": '"name"',
+            "colour": "#5d7285",
+            "size": 8,
+            "italic": True,
+            "halo_size": 0.7,
+            "priority": 4,
+            "min_feature_mm": 5,
+        },
+    },
+    {
+        "name": "states",
+        "pg_table": "states",
+        "geometry": "Polygon",
+        "wkb": "MultiPolygon",
+        "min_z": 4,
+        # Outline only, dashed, and dimmer than a road: dashed is what says "administrative
+        # boundary" rather than "another street", and it stops a state border from reading as a
+        # motorway at the zooms where both are on screen. The fill is switched off so the land
+        # colour underneath shows through unchanged.
+        "renderer": lambda: single_renderer(
+            symbol(
+                "fill",
+                "0",
+                [fill_layer("#000000", "#3d3d3d", 0.22, style="no", outline_style="dash")],
+            )
+        ),
+    },
     {
         "name": "roads",
         "gpkg": "roads",
@@ -292,12 +767,7 @@ THEMES = [
     },
     {
         "name": "land-base",
-        "gpkg": "countries",  # unused; see theme_datasource()
-        "datasource": (
-            "service='mellabasemap' key='fid' srid=4326 type=MultiPolygon "
-            "checkPrimaryKeyUnicity='1' table=\"public\".\"countries\" (geom)"
-        ),
-        "provider": "postgres",
+        "pg_table": "countries",
         "geometry": "Polygon",
         "wkb": "MultiPolygon",
         "min_z": None,  # the land base of the detail group; always drawn
@@ -354,37 +824,71 @@ def extent_element(tag: str) -> ET.Element:
     return e
 
 
+def theme_provider(theme: dict) -> str:
+    """`postgres` for the Natural Earth themes, `ogr` for everything reading a GeoPackage."""
+    return "postgres" if "pg_table" in theme else "ogr"
+
+
+def pg_datasource(table: str, wkb: str) -> str:
+    """A PostGIS layer reference carrying no credentials.
+
+    `service=` is resolved from pg_service.conf, which qgis-server/entrypoint.sh writes at container
+    start from the compose environment. That indirection is the whole reason project.qgz can live in
+    git and in a published image: the file names a service, never a host, user or password.
+    """
+    return (
+        f"service='mellabasemap' key='fid' srid=4326 type={wkb} "
+        f'checkPrimaryKeyUnicity=\'1\' table="public"."{table}" (geom)'
+    )
+
+
 def theme_datasource(theme: dict) -> str:
     """Where a themed layer reads from.
 
-    Most themes are GeoPackages under the /data bind mount. `land-base` is the exception: it reuses
-    the PostGIS Natural Earth table, because OSM cannot supply a reliable land polygon here. GDAL's
+    Most themes are GeoPackages under the /data bind mount. The Natural Earth themes are the
+    exception: they read PostGIS, because OSM cannot supply a reliable land polygon here. GDAL's
     OSM driver fails to assemble the largest admin_level=2 boundary relations — measured on the full
     planet build, France, Spain, the USA and Russia all came out with no polygon at all (4 of 12
     sample cities had no land), emitting "Non closed ring detected" as it gave up. Those are exactly
     the countries with far-flung overseas territories or an antimeridian crossing. Natural Earth is
     generalized, so coastlines are coarser than OSM would be at z14+, but it is complete, and
-    complete beats precise for the layer everything else is drawn on top of.
+    complete beats precise for the layer everything else is drawn on top of. The same argument moved
+    states/provinces to Natural Earth: see scripts/load-natural-earth-states.sh.
+
+    `subset` is how one source becomes several layers. Country names want to appear at different
+    zooms depending on how important the country is, and QGIS's per-layer `minScale` is the staging
+    mechanism this project already trusts — so rather than one layer with a rule-based label, the
+    source is split by a provider-side filter and each slice gets its own `min_z`. The filter runs
+    in PostGIS or in the GeoPackage's own SQLite, so it costs an index lookup, not a scan.
     """
-    if "datasource" in theme:
-        return theme["datasource"]
-    return f"/data/{theme['gpkg']}.gpkg|layername={theme['gpkg']}"
+    subset = theme.get("subset")
+    if "pg_table" in theme:
+        ds = pg_datasource(theme["pg_table"], theme["wkb"])
+        # The postgres provider takes its filter as a trailing sql= clause.
+        return f"{ds} sql={subset}" if subset else ds
+    ds = f"/data/{theme['gpkg']}.gpkg|layername={theme['gpkg']}"
+    # The OGR provider takes its filter as another pipe-separated token.
+    return f"{ds}|subset={subset}" if subset else ds
 
 
 def make_maplayer(theme: dict, layer_id: str) -> ET.Element:
-    scale_based = theme["min_z"] is not None
+    # `max_z` is the last zoom the layer draws at, and it exists for the label layers: a country
+    # name is orientation at z6 and noise at z12, where you can see the roads it is sitting on.
+    # Geometry layers leave it unset and draw all the way to z20.
+    max_z = theme.get("max_z")
+    scale_based = theme["min_z"] is not None or max_z is not None
     attrs = {
         "autoRefreshMode": "Disabled",
         "autoRefreshTime": "0",
         "geometry": theme["geometry"],
         "hasScaleBasedVisibilityFlag": "1" if scale_based else "0",
-        "labelsEnabled": "0",
+        "labelsEnabled": "1" if theme.get("label") else "0",
         "layerType": "Vector",
         "legendPlaceholderImage": "",
         # QGIS names these backwards from intuition: minScale is the zoomed-OUT bound (largest
         # denominator at which the layer still draws), maxScale the zoomed-in bound. 0 = unbounded.
-        "maxScale": "0",
-        "minScale": str(visibility_bound(theme["min_z"])) if scale_based else "0",
+        "maxScale": str(visibility_bound(max_z + 1)) if max_z is not None else "0",
+        "minScale": str(visibility_bound(theme["min_z"])) if theme["min_z"] is not None else "0",
         "readOnly": "0",
         "refreshOnNotifyEnabled": "0",
         "refreshOnNotifyMessage": "",
@@ -406,7 +910,7 @@ def make_maplayer(theme: dict, layer_id: str) -> ET.Element:
     ET.SubElement(ml, "datasource").text = theme_datasource(theme)
     ET.SubElement(ml, "layername").text = theme["name"]
     ml.append(srs_element())
-    ET.SubElement(ml, "provider", {"encoding": "UTF-8"}).text = theme.get("provider", "ogr")
+    ET.SubElement(ml, "provider", {"encoding": "UTF-8"}).text = theme_provider(theme)
     ET.SubElement(ml, "vectorjoins")
     ET.SubElement(ml, "layerDependencies")
     ET.SubElement(ml, "dataDependencies")
@@ -418,6 +922,8 @@ def make_maplayer(theme: dict, layer_id: str) -> ET.Element:
     for f, v in [("Identifiable", "0"), ("Removable", "1"), ("Searchable", "0"), ("Private", "0")]:
         ET.SubElement(flags, f).text = v
     ml.append(theme["renderer"]())
+    if theme.get("label"):
+        ml.append(labeling(theme["label"], theme["geometry"]))
     ET.SubElement(ml, "customproperties").append(ET.Element("Option"))
     ET.SubElement(ml, "blendMode").text = "0"
     ET.SubElement(ml, "featureBlendMode").text = "0"
@@ -503,26 +1009,98 @@ def patch_base(root: ET.Element) -> None:
         print(f"  WMTSMinScale {min_scale.text} -> 0 (was truncating the pyramid at z16)")
         min_scale.text = "0"
 
+    # Country names on `simple-countries` itself. That layer is not part of the detail group, and
+    # TILE_LAYER_ROUTES sends z0-3 to it, so without this the world has no names at all until the
+    # detail layers take over at z4. It reads the same Natural Earth table as `country-labels`, so
+    # the names do not change as you cross the switch — the point of using Natural Earth for text at
+    # every zoom and letting OSM add places on top, rather than treating it as a fallback.
+    for ml in root.iter("maplayer"):
+        ln = ml.find("layername")
+        if ln is None or ln.text != "simple-countries":
+            continue
+        for old_lab in list(ml.findall("labeling")):
+            ml.remove(old_lab)
+        ml.set("labelsEnabled", "1")
+        # After <renderer-v2>, which is where QGIS itself writes it.
+        renderer = ml.find("renderer-v2")
+        index = list(ml).index(renderer) + 1 if renderer is not None else len(ml)
+        ml.insert(index, labeling(COUNTRY_LABEL, "Polygon"))
+        print("  labelled 'simple-countries' with country names")
+
+
+def missing_pg_tables(themes: list[dict]) -> set[str] | None:
+    """The PostGIS tables these themes need but the database does not have.
+
+    Returns None when the check could not be made at all (no .env, no psql, database unreachable) —
+    which is not the same answer as "nothing is missing", and the caller says so rather than
+    claiming the project is fine.
+    """
+    env = REPO / ".env"
+    if not env.exists() or shutil.which("psql") is None:
+        return None
+    # Read the keys we need rather than sourcing: .env holds unquoted values containing spaces.
+    cfg = {}
+    for line in env.read_text().splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() in {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USERNAME", "DB_PASSWORD"}:
+            cfg[key.strip()] = value
+    if len(cfg) < 5:
+        return None
+
+    wanted = {t["pg_table"] for t in themes if "pg_table" in t}
+    try:
+        out = subprocess.run(
+            ["psql", "-qtAX", "-h", cfg["DB_HOST"], "-p", cfg["DB_PORT"],
+             "-U", cfg["DB_USERNAME"], "-d", cfg["DB_NAME"],
+             "-c", "select tablename from pg_tables where schemaname='public'"],
+            env={**os.environ, "PGPASSWORD": cfg["DB_PASSWORD"], "PGCONNECT_TIMEOUT": "5"},
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return wanted - set(out.stdout.split())
+
 
 def patch_detail(root: ET.Element, data_dir: Path, require_data: bool) -> None:
     # Only reference GeoPackages that actually exist. QGIS Server runs with
     # QGIS_SERVER_IGNORE_BAD_LAYERS=0, so a layer pointing at a missing file fails the entire
     # project rather than just that layer — and `buildings` is legitimately optional
     # (BUILDING_REGIONS in build-osm-detail.sh), so its absence is normal, not an error.
-    present = [t for t in THEMES if (data_dir / f"{t['gpkg']}.gpkg").exists()]
-    absent = [t["gpkg"] for t in THEMES if t not in present]
+    #
+    # The Natural Earth themes read PostGIS, not a file, so they are never in this check; their
+    # tables are verified against the database below.
+    gpkg_themes = [t for t in THEMES if "gpkg" in t]
+    present = [t for t in THEMES if "gpkg" not in t or (data_dir / f"{t['gpkg']}.gpkg").exists()]
+    absent = sorted({t["gpkg"] for t in gpkg_themes if t not in present})
 
-    if not present:
+    if not any("gpkg" in t for t in present):
         raise SystemExit(
             f"patch-project: no GeoPackages found in {data_dir}. "
             "Run scripts/build-osm-detail.sh first."
         )
     if absent and require_data:
-        print(f"  skipping themes with no data: {', '.join(sorted(absent))}")
+        print(f"  skipping themes with no data: {', '.join(absent)}")
     elif absent:
-        print(f"  WARNING: referencing absent GeoPackages: {', '.join(sorted(absent))}")
-        present = THEMES
+        print(f"  WARNING: referencing absent GeoPackages: {', '.join(absent)}")
+        present = list(THEMES)
     themes = present
+
+    # A PostGIS layer pointing at a table that does not exist takes down the whole project under
+    # QGIS_SERVER_IGNORE_BAD_LAYERS=0, and it does it at load time — every tile 500s, with the
+    # reason only in the renderer's log. Cheaper to refuse to write the file.
+    missing = missing_pg_tables(themes)
+    if missing is None:
+        print("  NOTE: could not reach PostgreSQL to verify the Natural Earth tables exist")
+    elif missing and require_data:
+        raise SystemExit(
+            "patch-project: missing PostGIS table(s): " + ", ".join(sorted(missing)) + ".\n"
+            "  Run scripts/load-natural-earth-states.sh first, or pass --allow-missing-data to "
+            "write the project anyway."
+        )
+    elif missing:
+        print(f"  WARNING: referencing absent PostGIS table(s): {', '.join(sorted(missing))}")
 
     tree = root.find("layer-tree-group")
     legend = root.find("legend")
@@ -538,18 +1116,20 @@ def patch_detail(root: ET.Element, data_dir: Path, require_data: bool) -> None:
     for grp in list(legend.findall("legendgroup")):
         if grp.get("name") == "countries":
             legend.remove(grp)
-    known = {t["name"] for t in THEMES}
-    stale_ids = set()
+    # Anything the layer tree no longer references. Matching on the current THEMES names is not
+    # enough: a theme that gets renamed (`countries-detail` did, in an earlier pass) leaves a
+    # maplayer behind that no name in the list matches, and it survives every subsequent run. The
+    # tree is the authority — `simple-countries` is the only layer outside the group we build here.
+    keep_ids = {
+        el.get("id") for el in tree.iter("layer-tree-layer") if el.get("id")
+    }
     for ml in list(layers.findall("maplayer")):
-        ln = ml.find("layername")
-        if ln is not None and ln.text in known:
-            id_el = ml.find("id")
-            if id_el is not None and id_el.text:
-                stale_ids.add(id_el.text)
+        id_el = ml.find("id")
+        if id_el is not None and id_el.text not in keep_ids:
             layers.remove(ml)
     if order is not None:
         for item in list(order.findall("layer")):
-            if item.get("id") in stale_ids:
+            if item.get("id") not in keep_ids:
                 order.remove(item)
 
     group = ET.Element(
@@ -562,7 +1142,9 @@ def patch_detail(root: ET.Element, data_dir: Path, require_data: bool) -> None:
 
     for theme in themes:
         layer_id = "{}_{}".format(theme["name"].replace("-", "_"), uuid.uuid4().hex)
-        datasource = f"/data/{theme['gpkg']}.gpkg|layername={theme['gpkg']}"
+        # Same source and provider the maplayer gets. These were hardcoded to ogr and a /data path,
+        # which made the tree entry for every PostGIS theme a lie — harmless, because QGIS Server
+        # reads the maplayer, but it means the project opened in QGIS Desktop disagreed with itself.
         ET.SubElement(
             group,
             "layer-tree-layer",
@@ -574,8 +1156,8 @@ def patch_detail(root: ET.Element, data_dir: Path, require_data: bool) -> None:
                 "legend_split_behavior": "0",
                 "name": theme["name"],
                 "patch_size": "-1,-1",
-                "providerKey": "ogr",
-                "source": datasource,
+                "providerKey": theme_provider(theme),
+                "source": theme_datasource(theme),
             },
         ).append(ET.Element("customproperties"))
         lg = ET.SubElement(

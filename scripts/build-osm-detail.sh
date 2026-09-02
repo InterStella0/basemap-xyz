@@ -30,6 +30,7 @@
 # recorded in a state file and skipped.
 set -euo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="${OSM_SRC_DIR:-/mnt/meow/OSM}"
 OUT="${OSM_DETAIL_DIR:-$SRC/out}"
 STATE="$OUT/.build-state"
@@ -61,13 +62,31 @@ F_WATER="\"natural\" IN ('water','bay','strait') OR landuse IN ('reservoir','bas
 F_LANDUSE="landuse IN ('forest','residential','industrial','commercial','farmland','meadow','grass','cemetery','quarry') OR leisure IN ('park','golf_course','nature_reserve') OR \"natural\" IN ('wood','scrub','sand','heath','grassland','glacier','wetland')"
 F_ROADS="highway IN ('motorway','trunk','primary','secondary','tertiary','motorway_link','trunk_link','primary_link','secondary_link')"
 
+# Places are the label source, and they are cheap in a way no other theme is: they come from the
+# `points` layer, which is plain tagged nodes, so GDAL never builds the node-reference index that
+# makes the polygon passes cost hours. Measured: a full points scan of the 752 MB central-america
+# extract is 4.2 s, against 64 s for the same file's multipolygons. The whole corpus took 8m32s
+# and produced 1,924,480 points in a 220 MB GeoPackage.
+#
+# hamlet/isolated_dwelling/locality are excluded deliberately: they are the bulk of place=* nodes
+# and are illegible clutter even at z16 on a basemap this dark.
+F_PLACES="place IN ('city','town','village','suburb','borough')"
+# name_en, not "name:en": scripts/osmconf-places.ini asks for the `name:en` tag, and GDAL already
+# sanitizes the colon out of the field name it exposes. Selecting the raw tag name fails with
+# "Unrecognized field name name:en". The label expression prefers name_en over the local-script
+# name where a translation exists. population comes through as a string — OSM does not promise a
+# number there — and patch-project.py tiers the city layers on CAST(population AS INTEGER) with a
+# coalesce, so a missing or non-numeric value lands in the smallest tier rather than off the map.
+C_PLACES="name,name_en,place,population"
+
 # The staging pass keeps anything any of the three polygon themes will later claim.
 F_POLY="($F_COUNTRIES) OR ($F_WATER) OR ($F_LANDUSE)"
 C_POLY="boundary,admin_level,name,natural,landuse,leisure"
 
 # pass | source layer | columns | simplify | filter | output
 PASSES="poly|multipolygons|$C_POLY|0.0001|$F_POLY|$STAGE
-roads|lines|highway|0.00005|$F_ROADS|$OUT/roads.gpkg"
+roads|lines|highway|0.00005|$F_ROADS|$OUT/roads.gpkg
+places|points|$C_PLACES|0|$F_PLACES|$OUT/places.gpkg"
 
 # Buildings stay a separate pass: planet-wide they are ~179 GB on their own, more than every other
 # theme combined, and they only render at z15+. Opt in per region:
@@ -160,6 +179,11 @@ while IFS='|' read -r pass layer columns simplify filter dest; do
         [ "$layer" = "multipolygons" ] && promote=(-nlt PROMOTE_TO_MULTI)
         simp=()
         [ "$simplify" != "0" ] && simp=(-simplify "$simplify")
+        # Only the places pass needs a non-stock attribute list (population, name:en). Scoped to
+        # that pass rather than exported globally so the already-completed polygon and line passes
+        # keep producing byte-identical output if they are ever re-run.
+        conf=()
+        [ "$pass" = "places" ] && conf=(--config OSM_CONFIG_FILE "$HERE/osmconf-places.ini")
 
         # Column and row selection go through -sql, not -select/-where: ogr2ogr rejects -select once
         # -append is present, which only bites from the second region onward and would otherwise
@@ -171,7 +195,7 @@ while IFS='|' read -r pass layer columns simplify filter dest; do
         # Unpiped, so the exit status is real: `ogr2ogr | grep || true` reports grep's status.
         set +e
         ogr2ogr -f GPKG "$dest" "$pbf" \
-            "${mode[@]}" "${promote[@]}" "${simp[@]}" \
+            "${conf[@]}" "${mode[@]}" "${promote[@]}" "${simp[@]}" \
             -sql "SELECT $columns FROM $layer WHERE $filter" \
             -nln "$pass" -gt 65536 \
             > "$CPL_TMPDIR/ogr2ogr-$pass.log" 2>&1
@@ -224,10 +248,12 @@ else
     done <<< "$DERIVED"
 fi
 
-# roads is produced directly by its pass, so verify it here rather than in the derive loop.
-if [ -f "$OUT/roads.gpkg" ]; then
-    has_spatial_index "$OUT/roads.gpkg" roads || die "roads has no spatial index"
-fi
+# roads and places are produced directly by their passes, so verify them here rather than in the
+# derive loop, which only covers the themes split out of the staging file.
+for direct in roads places; do
+    [ -f "$OUT/$direct.gpkg" ] || continue
+    has_spatial_index "$OUT/$direct.gpkg" "$direct" || die "$direct has no spatial index"
+done
 
 log "done"
 ls -lh "$OUT"/*.gpkg 2>/dev/null | awk '{printf "  %-22s %s\n", $9, $5}'
@@ -237,7 +263,8 @@ Staging file $(basename "$STAGE") is kept so the themes can be re-split with dif
 cheaply (rerun with SKIP_DERIVE= to redo just the split). Delete it to reclaim the space.
 
 Next:
-  python3 scripts/patch-project.py --detail
-  edit .env: TILE_LAYER_ROUTES=countries@0-5=simple-countries
+  scripts/load-natural-earth-states.sh        # if public.states does not exist yet
+  python3 scripts/patch-project.py --base --detail
+  edit .env: TILE_LAYER_ROUTES=countries@0-3=simple-countries
   sh scripts/sync-project-version.sh && docker compose up -d --build renderer && docker compose up -d api
 EOF

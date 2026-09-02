@@ -5,6 +5,17 @@
 ARG QGIS_VERSION=4.2.1
 FROM qgis/qgis-server:${QGIS_VERSION}
 
+# Fonts. Without these every label renders as a tofu box: the base image carries only what QGIS
+# itself needs, and OSM `name` values are in local script, so a Latin-only family covers a minority
+# of the planet. DejaVu is the family the label styles name; Qt falls back to Noto for the glyphs it
+# lacks, which is what makes Tokyo and Cairo legible. fonts-noto-cjk is ~200 MB of the ~250 MB this
+# layer adds, and it is the half that matters most.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        fonts-dejavu-core fonts-noto-core fonts-noto-cjk \
+ && fc-cache -f \
+ && rm -rf /var/lib/apt/lists/*
+
 ENV TZ=UTC
 ENV QGIS_PREFIX_PATH=/usr
 ENV QGIS_SERVER_LOG_STDERR=1
