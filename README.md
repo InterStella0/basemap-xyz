@@ -219,6 +219,8 @@ as an upper bound. The cumulative tile counts are unforgiving either way:
 | z0–14 | 357,913,941 | ~7.5 years |
 | z0–15 | 1,431,655,765 | ~30 years |
 
+Note: Doing 1.5 tiles/s for every tier is misleading, as you zoom in, it gets faster assuming you have spatial indexing.
+
 So a full-planet z0–15 is a background job that runs for as long as it runs; start low and let
 it climb. The dedup means most of those tiles cost one render *and one directory entry*, which is
 the other hard limit: a billion files need roughly a terabyte of filesystem metadata alone. The
