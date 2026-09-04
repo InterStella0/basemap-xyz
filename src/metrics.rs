@@ -22,6 +22,15 @@ pub struct Metrics {
     /// timeout) rather than because one tile failed.
     pub renderer_unavailable: AtomicU64,
     pub render_millis_total: AtomicU64,
+    /// Renders that were a metatile rather than a single tile. Counted in `renders` too, so
+    /// `renders - metatile_renders` is the number of one-off tile renders.
+    pub metatile_renders: AtomicU64,
+    /// Tiles produced by slicing those metatiles. The ratio against `metatile_renders` is the
+    /// leverage metatiling is actually buying: 16 for a healthy 4x4 band.
+    pub metatile_tiles: AtomicU64,
+    /// Metatiles that rendered but could not be cut up — a wrong-sized or undecodable image.
+    /// Distinct from `render_errors`, because the renderer answered and the fault is downstream.
+    pub metatile_slice_errors: AtomicU64,
     /// Filled in by each janitor sweep; zero until the first one finishes.
     pub last_sweep_files: AtomicU64,
     pub last_sweep_bytes: AtomicU64,
@@ -51,6 +60,9 @@ impl Metrics {
             "disk_hits": Self::get(&self.disk_hits),
             "memory_hits": Self::get(&self.memory_hits),
             "renders": renders,
+            "metatile_renders": Self::get(&self.metatile_renders),
+            "metatile_tiles": Self::get(&self.metatile_tiles),
+            "metatile_slice_errors": Self::get(&self.metatile_slice_errors),
             "render_errors": Self::get(&self.render_errors),
             "negative_hits": Self::get(&self.negative_hits),
             "queue_timeouts": Self::get(&self.queue_timeouts),

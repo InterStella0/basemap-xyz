@@ -74,6 +74,9 @@ fn error_response(failure: &TileFailure, metrics: &Metrics) -> Response {
             (StatusCode::SERVICE_UNAVAILABLE, Some(30))
         }
         TileFailure::RecentlyFailed => (StatusCode::BAD_GATEWAY, Some(30)),
+        // The renderer answered, but with an image we could not cut into tiles. Retrying straight
+        // away would just repeat it, so this gets the same slow retry as a recently-failed tile.
+        TileFailure::Slice(_) => (StatusCode::BAD_GATEWAY, Some(30)),
         TileFailure::Render(_) => (StatusCode::BAD_GATEWAY, Some(10)),
     };
 

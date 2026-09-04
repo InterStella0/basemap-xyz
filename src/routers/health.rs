@@ -39,6 +39,10 @@ pub async fn health(Data(state): Data<&AppState>) -> Json<serde_json::Value> {
             "available": state.renderer.available_permits(),
         },
         "zoom": { "min": state.config.min_zoom, "max": state.config.max_zoom },
+        "metatile": {
+            "enabled": state.config.metatile.is_enabled(),
+            "buffer_px": state.config.metatile_buffer_px,
+        },
     }))
 }
 

@@ -6,10 +6,14 @@ use bytes::Bytes;
 use tokio::sync::Semaphore;
 
 use crate::config::LayerRoutes;
+use crate::metatile::MetaCoord;
 use crate::metrics::Metrics;
 use crate::tiles::TileCoord;
 
-#[derive(Debug, thiserror::Error)]
+/// `Clone` because the single-flight caches in `state.rs` hand a failure back to every waiter
+/// behind an `Arc`, and the waiter needs an owned error to return. Every variant is a `Duration`,
+/// a `String` or a number, so this costs nothing worth avoiding.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RenderError {
     /// Every render slot was busy for longer than the caller is willing to wait. Distinct from a
     /// renderer failure: the tile is probably fine, we just refuse to queue further.
@@ -156,6 +160,48 @@ impl Renderer {
     /// and letting more requests than that through just moves the queue somewhere we cannot
     /// observe or time out.
     pub async fn fetch(&self, coord: &TileCoord) -> Result<Bytes, RenderError> {
+        let upstream = self.routes.resolve(&coord.layer, coord.z).to_string();
+        let started = Instant::now();
+        let body = self.request(&coord.to_string(), coord.wmts_query(&upstream)).await?;
+
+        Metrics::bump(&self.metrics.renders);
+        Metrics::add(&self.metrics.render_millis_total, started.elapsed().as_millis() as u64);
+        tracing::debug!(%coord, upstream, ms = started.elapsed().as_millis(), bytes = body.len(), "rendered tile");
+        Ok(body)
+    }
+
+    /// Renders a whole `n x n` block of tiles as one image, buffer included.
+    ///
+    /// This is a WMS `GetMap` rather than a WMTS `GetTile` because only `GetMap` takes an arbitrary
+    /// extent. Everything else — the semaphore, the breaker, the body checks — is identical to
+    /// `fetch`, and deliberately so: a metatile is just a bigger render, and it must fail in the
+    /// same shapes so `state.rs` can treat both the same way.
+    pub async fn fetch_metatile(&self, meta: &MetaCoord, buffer_px: u32) -> Result<Bytes, RenderError> {
+        let upstream = self.routes.resolve(&meta.layer, meta.z).to_string();
+        let started = Instant::now();
+        let body = self.request(&meta.to_string(), meta.wms_query(&upstream, buffer_px)).await?;
+
+        Metrics::bump(&self.metrics.renders);
+        Metrics::bump(&self.metrics.metatile_renders);
+        Metrics::add(&self.metrics.render_millis_total, started.elapsed().as_millis() as u64);
+        tracing::debug!(
+            %meta,
+            upstream,
+            px = meta.size_px(buffer_px),
+            ms = started.elapsed().as_millis(),
+            bytes = body.len(),
+            "rendered metatile"
+        );
+        Ok(body)
+    }
+
+    /// The part `fetch` and `fetch_metatile` share: queue for a slot, make the request, and judge
+    /// the answer. `what` names the unit of work for logs only.
+    async fn request(
+        &self,
+        what: &str,
+        query: Vec<(&'static str, String)>,
+    ) -> Result<Bytes, RenderError> {
         // Fail fast while the circuit is open: the caller turns this into a 503, and the state
         // layer deliberately does not negative-cache it, so every miss keeps answering promptly.
         if !self.breaker.allows() {
@@ -171,12 +217,11 @@ impl Renderer {
             }
         };
 
-        let upstream = self.routes.resolve(&coord.layer, coord.z);
         let started = Instant::now();
         let response = self
             .client
             .get(self.ows_url())
-            .query(&coord.wmts_query(upstream))
+            .query(&query)
             .send()
             .await
             .map_err(|err| {
@@ -188,7 +233,7 @@ impl Renderer {
                 if self.breaker.record_failure() {
                     Metrics::bump(&self.metrics.circuit_opens);
                     tracing::warn!(
-                        %coord,
+                        target = what,
                         failures = self.breaker.threshold,
                         "renderer transport failures reached threshold; circuit open"
                     );
@@ -209,6 +254,15 @@ impl Renderer {
             .to_ascii_lowercase();
 
         if !status.is_success() {
+            // A 404 here is worth calling out: the renderer image's own nginx answers an overrun
+            // FastCGI read that way (its error_page target does not exist), so this usually means
+            // the render outlived `fastcgi_read_timeout` rather than that anything is malformed.
+            if status.as_u16() == 404 {
+                tracing::warn!(
+                    target = what,
+                    "renderer returned 404; if this is a slow render, raise fastcgi_read_timeout in the renderer image"
+                );
+            }
             return Err(RenderError::Status(status.as_u16()));
         }
 
@@ -228,10 +282,6 @@ impl Renderer {
         if body.is_empty() {
             return Err(RenderError::EmptyBody);
         }
-
-        Metrics::bump(&self.metrics.renders);
-        Metrics::add(&self.metrics.render_millis_total, started.elapsed().as_millis() as u64);
-        tracing::debug!(%coord, upstream, ms = started.elapsed().as_millis(), bytes = body.len(), "rendered tile");
         Ok(body)
     }
 

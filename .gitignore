@@ -7,3 +7,7 @@
 
 # RustRover / IntelliJ
 /.idea/
+
+# Python bytecode from scripts/ (patch-project.py is imported by nothing, but running it
+# from the repo root leaves this behind).
+__pycache__/

@@ -86,6 +86,72 @@ impl FromStr for LayerRoutes {
     }
 }
 
+/// Metatile edge, in tiles, per zoom band.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetatileSizes(Vec<(u8, u8, u32)>);
+
+impl Default for MetatileSizes {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl MetatileSizes {
+    pub fn resolve(&self, z: u8) -> u32 {
+        self.0
+            .iter()
+            .find(|(lo, hi, _)| z >= *lo && z <= *hi)
+            .map(|(_, _, n)| *n)
+            .unwrap_or(1)
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.0.iter().any(|(_, _, n)| *n > 1)
+    }
+}
+
+/// `0-6:2,7-20:4`
+///
+/// Parsed strictly for the same reason `LayerRoutes` is: a typo here silently changes how every
+/// tile in a band is rendered, and `get_env_default` turns the error into a boot panic.
+impl FromStr for MetatileSizes {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let mut bands = Vec::new();
+        for rule in raw.split(',').map(str::trim).filter(|r| !r.is_empty()) {
+            let (range, size) = rule
+                .split_once(':')
+                .ok_or_else(|| format!("band {rule:?} is missing ':<tiles per side>'"))?;
+            let (lo, hi) = range
+                .split_once('-')
+                .ok_or_else(|| format!("zoom range {range:?} in {rule:?} is not '<lo>-<hi>'"))?;
+
+            let parse = |v: &str, which: &str| -> Result<u32, String> {
+                v.trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("{which} {v:?} in band {rule:?} is not a number"))
+            };
+            let lo = u8::try_from(parse(lo, "low zoom")?)
+                .map_err(|_| format!("low zoom in band {rule:?} is above 255"))?;
+            let hi = u8::try_from(parse(hi, "high zoom")?)
+                .map_err(|_| format!("high zoom in band {rule:?} is above 255"))?;
+            let size = parse(size, "block size")?;
+
+            if lo > hi {
+                return Err(format!("zoom range {lo}-{hi} in band {rule:?} is inverted"));
+            }
+            // Powers of two only: any other edge would put block boundaries at different places on
+            // adjacent zooms for no benefit, and 8x8 at 256px is already a 2048px render.
+            if !matches!(size, 1 | 2 | 4 | 8) {
+                return Err(format!("block size {size} in band {rule:?} must be 1, 2, 4 or 8"));
+            }
+            bands.push((lo, hi, size));
+        }
+        Ok(Self(bands))
+    }
+}
+
 /// Reads an optional variable, falling back to the compiled-in default. A present-but-unparseable
 /// value is a panic, not a silent fallback: a typo in TILE_TTL_DAYS should stop the container
 /// rather than quietly serve a different TTL than the operator asked for.
@@ -128,15 +194,14 @@ pub struct Config {
     pub memory_capacity: u64,
     pub memory_ttl: Duration,
     pub negative_ttl: Duration,
-    /// Opaque operator-supplied tag (by convention a hash of project.qgz, written by
-    /// `scripts/sync-project-version.sh`) that the cache compares against a marker on disk at boot.
-    /// A mismatch means the cartography changed, so the whole cache is wiped rather than waiting
-    /// out `tile_ttl`. `None` (unset or empty) means "not tracking this" — pure TTL behaviour,
-    /// unchanged from today.
+    /// Cache version
     pub project_version: Option<String>,
     /// Zoom-dependent mapping from the layer named in the URL to the QGIS layer that renders it.
     /// Empty (the default) means every layer renders from its own name.
     pub layer_routes: LayerRoutes,
+    /// How many tiles per side QGIS renders in one request, per zoom band. See `MetatileSizes`.
+    pub metatile: MetatileSizes,
+    pub metatile_buffer_px: u32,
 }
 
 impl Config {
@@ -181,6 +246,8 @@ impl Config {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             layer_routes: get_env_default("TILE_LAYER_ROUTES", LayerRoutes::default()),
+            metatile: get_env_default("METATILE_SIZE", MetatileSizes::default()),
+            metatile_buffer_px: get_env_default("METATILE_BUFFER_PX", 128),
         }
     }
 }
@@ -228,6 +295,47 @@ mod tests {
     fn whitespace_and_trailing_separators_are_tolerated() {
         let r = routes("  countries@0-5 = simple-countries , ");
         assert_eq!(r.resolve("countries", 2), "simple-countries");
+    }
+
+    fn sizes(raw: &str) -> MetatileSizes {
+        raw.parse().expect("should parse")
+    }
+
+    #[test]
+    fn an_unset_metatile_table_renders_every_zoom_one_tile_at_a_time() {
+        let m = MetatileSizes::default();
+        assert!(!m.is_enabled());
+        for z in [0, 5, 7, 20] {
+            assert_eq!(m.resolve(z), 1);
+        }
+    }
+
+    #[test]
+    fn metatile_bands_are_inclusive_and_fall_through_to_one() {
+        let m = sizes("0-6:2,7-20:4");
+        assert!(m.is_enabled());
+        assert_eq!(m.resolve(0), 2);
+        assert_eq!(m.resolve(6), 2);
+        assert_eq!(m.resolve(7), 4);
+        assert_eq!(m.resolve(20), 4);
+        assert_eq!(m.resolve(21), 1);
+    }
+
+    #[test]
+    fn malformed_metatile_bands_are_rejected_rather_than_ignored() {
+        for bad in [
+            "0-6",        // no size
+            "0-6:",       // empty size
+            "6:2",        // range is not lo-hi
+            "6-0:2",      // inverted
+            "0-999:2",    // zoom out of u8 range
+            "0-6:3",      // not a power of two
+            "0-6:0",      // zero would divide by zero downstream
+            "0-6:16",     // a 4096px render is not a tile server
+            "0-6:two",    // not a number
+        ] {
+            assert!(bad.parse::<MetatileSizes>().is_err(), "expected {bad:?} to be rejected");
+        }
     }
 
     /// Every one of these would otherwise serve the wrong cartography, silently, until the TTL

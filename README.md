@@ -192,6 +192,11 @@ It is built for very long, interruptible runs:
   `.pregenerate-failures.jsonl` in the store and retried with `--retry-failed`.
 - **Route-aware** — it parses `TILE_LAYER_ROUTES` from `.env` with the same semantics as the
   API, so z0–3 renders `simple-countries` and z4+ renders `countries` automatically.
+- **Metatiling, the same way the API does** — it reads `METATILE_SIZE` and `METATILE_BUFFER_PX`
+  from the same `.env` and renders a block per request, so the store and the miss path produce the
+  same labels. This is not optional: a store built one tile at a time serves clipped labels no
+  matter what the API does. The slicing needs Pillow; `--metatile 1` is the old path and stays pure
+  stdlib. `--estimate` prints renders as well as tiles, which is now the number that matters.
 - **Honest about scale** — see the table below.
 
 It also writes the `.project-version` marker into the store, so the API's boot-time version
@@ -200,7 +205,9 @@ sync sees a match instead of wiping the pregenerated tiles.
 ### How long this takes
 
 Measured on the live renderer: one warm tile takes 0.6–2.8 s, and concurrent renders mostly
-serialize (5 in parallel ≈ 1.1 tiles/s). The cumulative tile counts are unforgiving:
+serialize (5 in parallel ≈ 1.1 tiles/s). Metatiling divides the *render* count by up to 16 while
+leaving the tile count alone — at z7 it turned 8.9 s/tile into 2.9 s/tile — so read the table below
+as an upper bound. The cumulative tile counts are unforgiving either way:
 
 | Range | Tiles | At ~1.5 tiles/s |
 |---|---|---|
@@ -341,7 +348,7 @@ from OpenStreetMap, and switch on as you zoom in.
 |---|---|---|---|
 | `simple-countries` | PostGIS `countries` | z0–3 | The low-zoom route; carries the same country labels as below |
 | `country-labels` | PostGIS `countries` | z4–9 | Uppercase, letter-spaced |
-| `states` | PostGIS `states` | z4+ | Dashed boundary line, no label |
+| `states` | PostGIS `states` | z4+ | Dashed `#666` boundary line, no label — brighter than a major road, because past z11 it is the only cue for which state you are in |
 | `state-labels-major` | PostGIS `states` | z5–11 | `labelrank <= 4` — the ~800 units Natural Earth ranks worth a world-map name |
 | `state-labels` | PostGIS `states` | z7–11 | `labelrank` 5–19; 20 is Natural Earth's "never label this" bucket |
 | `places-metro` | `places.gpkg` | z4+ | `place=city`, population ≥ 1M — 652 worldwide |
@@ -360,9 +367,10 @@ where you can already see the streets it is sitting on.
 Three mechanisms do the work, and all three matter:
 
 - **`centroidWhole="1"`** on every polygon label. Without it QGIS anchors a polygon's label at the
-  centroid of the part visible in the current request extent — and every 256×256 `GetTile` *is* its
-  own extent, so "France" would be redrawn in every tile France touches. With it the anchor is the
-  whole geometry's centroid and the name is drawn once.
+  centroid of the part visible in the current request extent, so "France" would be redrawn in every
+  block France touches. With it the anchor is the whole geometry's centroid and the name is drawn
+  once — which also means it lands in whichever block holds the country's centre, so from about z10
+  a state name is present but sparse. That is why the state label band stops at z11.
 - **`minFeatureSize`**, in mm. A country too small to be worth 6 mm on screen loses its label until
   you zoom in far enough. This stages the whole set by zoom for free, so `country-labels` is one
   layer rather than one per importance tier.
@@ -374,13 +382,49 @@ Place labels prefer the `name:en` tag where mappers supplied one and fall back t
 `name`. The renderer image installs DejaVu and Noto (including CJK) for the rest; without them every
 non-Latin name renders as a row of tofu boxes.
 
-### The seam
+### The seam, and why tiles are rendered in blocks
 
-QGIS Server renders each tile independently, so a label whose text crosses a tile boundary is
-clipped at the edge. `centroidWhole` fixes the far worse artifact — the same name repeating in every
-tile — but not this one. Fixing it properly means metatiling: rendering a 3×3 block in one `GetMap`
-and slicing it, which reshapes the cache and single-flight path in `src/renderer.rs` and
-`src/routers/tiles.rs`. Not done; noted.
+QGIS labels each request against the extent it is given and nothing else. Ask it for one 256×256
+tile and a label whose text crosses that tile's edge is cut in half, and two labels in adjacent
+tiles cannot see each other, so they overprint. A 4×4 block of z7 tiles over Germany fetched one at
+a time gives `…lefeld`, `Nüremb…`, `Karlsr…`, and *Frankfurt* printed straight through *Wiesbaden*.
+
+So the API does not render tiles. It renders **metatiles**: an `n × n` block in one WMS `GetMap`,
+plus `METATILE_BUFFER_PX` of overspill on every side, then cuts the result into 256 px tiles and
+writes all `n²` of them. See `src/metatile.rs`.
+
+- Inside a block there are no seams at all: every label in it was placed against one canvas.
+- Across block boundaries the **buffer** is what stitches: a label is centred on its anchor, so an
+  anchor up to `METATILE_BUFFER_PX` outside the block is still drawn here, at exactly the position
+  the neighbouring block draws it. The default 128 px is a little over half the width of the widest
+  label this cartography produces.
+- What can still go wrong: a label near a block edge whose collision outcome differs between the two
+  renders. Rare, and one block boundary in four is the worst case rather than every tile edge.
+
+It is also **cheaper**, because a QGIS request carries a large fixed cost regardless of size —
+roughly 7 s at z7 on this hardware. Measured against the live renderer:
+
+| | one at a time | as one 4×4 block (+128 px) |
+|---|---|---|
+| z7 Germany, 16 tiles | 142.3 s | 45.8 s |
+| z9 Germany, 16 tiles | 72 s | 51.1 s |
+| z12 Munich, 16 tiles | 1.6 s | 0.9 s |
+
+`METATILE_SIZE` is banded by zoom (`0-6:2,7-20:4`) because that fixed cost is not the whole story:
+`water` and `landuse` are drawn from the full OSM extracts from z4 up, so a *single* z5 tile over
+Europe is 23 s and a 4×4 block there would run past 100 s.
+
+Two consequences worth knowing:
+
+- **`scripts/pregenerate-tiles.py` metatiles too**, reading the same two keys from `.env`. It has to:
+  the pregenerated store is what the site actually serves, so a store built one tile at a time would
+  serve broken labels no matter what the API does. Its slicing needs Pillow; `--metatile 1` is the
+  old tile-at-a-time path and stays pure stdlib.
+- **A block is a bigger unit of work than a tile**, so `RENDER_TIMEOUT_SECS` is 240 rather than 60,
+  and the renderer image raises its own nginx `fastcgi_read_timeout` to match
+  (`qgis-server/qgis-timeouts.conf`). The stock image caps every render at 60 s and — because its
+  `error_page` target does not exist — answers an overrun with a **404**, which the API cannot tell
+  apart from a genuinely bad tile.
 
 ### What is not labelled
 
@@ -398,6 +442,19 @@ that empties.
 
 **nginx does not check the TTL** — it serves whatever is on disk. So a tile can survive up to
 `TTL + sweep_interval`. That is intended for a basemap; it is not a bug.
+
+**One store, two stacks.** On the home box the compose stack and the Swarm stack both bind-mount
+`$TILES_STORE_DIR`. That is fine while they render the same `project.qgz`, and a trap while they do
+not: the compose api wipes the whole store at boot whenever `PROJECT_VERSION` changes, which throws
+away the tiles the Swarm stack is serving to the public — and the Swarm api has no `PROJECT_VERSION`
+of its own, so it will never wipe or notice. When iterating on cartography ahead of a deploy, point
+the local stack somewhere else:
+
+```sh
+TILES_STORE_DIR=/mnt/meow/OSM/tiles-dev docker compose up -d
+```
+
+and put it back once both stacks are on the same image.
 
 If `PROJECT_VERSION` is set in `.env`, the API compares it against a marker it keeps at the root of
 the tile store on every boot; a mismatch — including "no marker yet" — wipes the whole store

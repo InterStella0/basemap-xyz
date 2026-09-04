@@ -691,15 +691,22 @@ THEMES = [
         "geometry": "Polygon",
         "wkb": "MultiPolygon",
         "min_z": 4,
-        # Outline only, dashed, and dimmer than a road: dashed is what says "administrative
-        # boundary" rather than "another street", and it stops a state border from reading as a
-        # motorway at the zooms where both are on screen. The fill is switched off so the land
-        # colour underneath shows through unchanged.
+        # Outline only and dashed: dashed is what says "administrative boundary" rather than
+        # "another street", and it stops a state border from reading as a motorway at the zooms
+        # where both are on screen. The fill is switched off so the land colour underneath shows
+        # through unchanged.
+        #
+        # Deliberately bright for a dark basemap: the same 0.5 mm as a motorway and a lighter grey
+        # than one (#757575 against #4a4a4a). The state *name* only exists in the z5-11 band, so
+        # from z12 up this line is the only cue left for which state you are in, and at 0.22 mm of
+        # #3d3d3d on a #0f0f0f ground it was something you had to go looking for. A thin dashed
+        # line also loses much of its nominal brightness to antialiasing — 0.35 mm of #666666
+        # measured dimmer on screen than the roads it is supposed to out-rank.
         "renderer": lambda: single_renderer(
             symbol(
                 "fill",
                 "0",
-                [fill_layer("#000000", "#3d3d3d", 0.22, style="no", outline_style="dash")],
+                [fill_layer("#000000", "#757575", 0.5, style="no", outline_style="dash")],
             )
         ),
     },

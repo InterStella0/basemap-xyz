@@ -21,6 +21,13 @@ ENV QGIS_PREFIX_PATH=/usr
 ENV QGIS_SERVER_LOG_STDERR=1
 ENV QGIS_SERVER_LOG_LEVEL=2
 
+# The bundled nginx caps every FastCGI read at 60s and, because its 50x.html does not exist,
+# answers an overrun with a 404 rather than a 504 — which the API cannot tell apart from a genuinely
+# bad tile. Metatiles are a bigger unit of work than a single 256px tile, so that ceiling has to go
+# up; the real budget stays RENDER_TIMEOUT_SECS on the API side.
+COPY qgis-timeouts.conf /etc/nginx/qgis.d/timeouts.conf
+COPY 50x.html /usr/share/nginx/html/50x.html
+
 # The project is baked into the image rather than mounted, so a deployed tag is a reproducible
 # pairing of cartography and server version.
 COPY project/project.qgz /home/qgis/project/project.qgz

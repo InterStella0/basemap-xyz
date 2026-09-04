@@ -21,6 +21,9 @@ dotenv = "0.15.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.17"
+# PNG only. A metatile is one big render that has to be cut into 256px tiles, so the API needs to
+# decode and re-encode PNG; the rest of the crate's format zoo would be dead weight in the image.
+image = { version = "0.25.8", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 poem = { version = "3.1.12", features = ["test"] }

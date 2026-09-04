@@ -18,6 +18,16 @@ The script is built for very long, interruptible runs:
   * honest           — --estimate prints tile counts and an ETA at a measured tile
                        rate before a single render is issued
 
+It renders *metatiles*, not tiles: an n x n block in one WMS GetMap, plus a buffer that
+is cropped away, then cut into 256px tiles. This has to match what the API does on a
+cache miss (src/metatile.rs) — QGIS labels each request against the extent it is given,
+so a tile rendered on its own has every label crossing its edge cut in half, and a store
+built that way would serve broken labels no matter what the API does. METATILE_SIZE and
+METATILE_BUFFER_PX come from the same .env the API reads.
+
+The metatile path needs Pillow for the slicing; `--metatile 1` is the old
+tile-at-a-time path and stays pure stdlib.
+
 Usage:
   scripts/pregenerate-tiles.py --dry-run --max-zoom 3          # what would be done
   scripts/pregenerate-tiles.py --estimate --max-zoom 8         # counts + ETA, no renders
@@ -25,8 +35,8 @@ Usage:
   scripts/pregenerate-tiles.py --retry-failed                  # re-attempt logged failures
 
 Configuration comes from the repo root's .env (TILE_LAYER_ROUTES, PROJECT_VERSION,
-TILES_STORE_DIR, RENDERER_PUBLISH_PORT, RENDER_TIMEOUT_SECS) and can be overridden by
-flags or environment variables. Stdlib only: no pip install needed.
+TILES_STORE_DIR, RENDERER_PUBLISH_PORT, RENDER_TIMEOUT_SECS, METATILE_SIZE,
+METATILE_BUFFER_PX) and can be overridden by flags or environment variables.
 """
 
 import argparse
@@ -34,6 +44,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import io
 import shutil
 import sqlite3
 import struct
@@ -57,6 +68,11 @@ BLANK_DIR = ".blank"
 
 DEFAULT_RENDERER_PORT = 8081
 DEFAULT_TPS = 1.5  # measured on the live renderer: 5 concurrent renders serialize to ~1.1 tiles/s
+TILE_PX = 256
+# Edge of the Web-Mercator square in metres; mirrors MERCATOR_HALF_SPAN in src/metatile.rs.
+MERCATOR_HALF_SPAN = 20037508.342789244
+DEFAULT_METATILE = "0-6:2,7-20:4"
+DEFAULT_METATILE_BUFFER = 128
 
 
 # ---------------------------------------------------------------------------------------
@@ -125,6 +141,42 @@ def resolve_upstream(routes, public, z):
         if p == public and lo <= z <= hi:
             return upstream
     return public
+
+
+def parse_metatile(raw):
+    """Parses METATILE_SIZE exactly like MetatileSizes::from_str in src/config.rs.
+
+    Format: `lo-hi:tiles-per-side,...`; first matching band wins, unbanded zooms render one
+    tile at a time. Strict, because a band silently misread here would fill the store with
+    tiles the API would then never agree with.
+    """
+    bands = []
+    for rule in raw.split(","):
+        rule = rule.strip()
+        if not rule:
+            continue
+        if ":" not in rule or "-" not in rule:
+            raise ValueError(f"malformed metatile band {rule!r}: expected '<lo>-<hi>:<tiles>'")
+        zoom_range, _, size_raw = rule.partition(":")
+        lo_raw, _, hi_raw = zoom_range.partition("-")
+        try:
+            lo, hi, size = int(lo_raw.strip()), int(hi_raw.strip()), int(size_raw.strip())
+        except ValueError:
+            raise ValueError(f"metatile band {rule!r} has a non-numeric field") from None
+        if not (0 <= lo <= hi < 32):
+            raise ValueError(f"zoom range {lo}-{hi} in band {rule!r} is invalid or inverted")
+        if size not in (1, 2, 4, 8):
+            raise ValueError(f"block size {size} in band {rule!r} must be 1, 2, 4 or 8")
+        bands.append((lo, hi, size))
+    return bands
+
+
+def metatile_size(bands, z):
+    """Block edge for this zoom, clamped to the pyramid. 1 means one tile per render."""
+    for lo, hi, size in bands:
+        if lo <= z <= hi:
+            return max(1, min(size, 1 << z))
+    return 1
 
 
 def public_layers(routes, fallback):
@@ -339,6 +391,105 @@ def fetch_tile(base_url, upstream, z, x, y, timeout):
     return data
 
 
+def metatile_bbox(z, mx, my, n, buffer_px):
+    """EPSG:3857 extent of a block, grown by `buffer_px` on all four sides.
+
+    Mirrors MetaCoord::bbox in src/metatile.rs; XYZ rows count from the north edge.
+    """
+    span = 2 * MERCATOR_HALF_SPAN / (1 << z)
+    pad = buffer_px / TILE_PX * span
+    return (
+        -MERCATOR_HALF_SPAN + mx * span - pad,
+        MERCATOR_HALF_SPAN - (my + n) * span - pad,
+        -MERCATOR_HALF_SPAN + (mx + n) * span + pad,
+        MERCATOR_HALF_SPAN - my * span + pad,
+    )
+
+
+def fetch_metatile(base_url, upstream, z, mx, my, n, buffer_px, timeout):
+    """One WMS GetMap covering a whole block; query shape copied from MetaCoord::wms_query.
+
+    WMS rather than WMTS because only GetMap takes an arbitrary extent. TRANSPARENT=TRUE is
+    load-bearing: without it the background is opaque white where GetTile gives transparent,
+    which paints a white sea.
+    """
+    min_x, min_y, max_x, max_y = metatile_bbox(z, mx, my, n, buffer_px)
+    px = n * TILE_PX + 2 * buffer_px
+    query = urllib.parse.urlencode(
+        [
+            ("SERVICE", "WMS"),
+            ("VERSION", "1.1.1"),
+            ("REQUEST", "GetMap"),
+            ("LAYERS", upstream),
+            ("STYLES", ""),
+            ("FORMAT", "image/png"),
+            ("TRANSPARENT", "TRUE"),
+            ("SRS", "EPSG:3857"),
+            ("BBOX", f"{min_x},{min_y},{max_x},{max_y}"),
+            ("WIDTH", str(px)),
+            ("HEIGHT", str(px)),
+        ]
+    )
+    req = urllib.request.Request(
+        f"{base_url}/ows/?{query}", headers={"User-Agent": "dark-basemap-pregenerate/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "").lower()
+            data = resp.read()
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+        # The renderer image's own nginx answers an overrun FastCGI read with a 404, because its
+        # error_page target does not exist. A 404 here almost always means the block took longer
+        # than its fastcgi_read_timeout, not that anything is malformed.
+        raise TileError(f"transport: {exc}") from exc
+    if "xml" in content_type or data.startswith(b"<"):
+        raise TileError(f"service exception: {data[:200]!r}")
+    if not content_type.startswith("image/png"):
+        raise TileError(f"unexpected content-type {content_type!r}")
+    if not data.startswith(PNG_MAGIC) or not data:
+        raise TileError("empty or non-PNG body")
+    return data
+
+
+def slice_metatile(data, n, buffer_px):
+    """Cuts a rendered block into `n*n` tiles, dropping the buffer.
+
+    Yields `(dx, dy, png)` in row-major order. Pillow only for this: the stdlib decoder above
+    unfilters a scanline at a time in Python, which is tolerable for the 256px blankness check
+    and far too slow for a 1280px block.
+    """
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - depends on the host
+        sys.exit(
+            "pregenerate: slicing metatiles needs Pillow (pip install pillow).\n"
+            "Pass --metatile 1 to fall back to one GetTile per tile — but note that the API\n"
+            "metatiles on a cache miss, so the store would then disagree with what it serves."
+        )
+    want = n * TILE_PX + 2 * buffer_px
+    image = Image.open(io.BytesIO(data))
+    if image.size != (want, want):
+        raise TileError(f"renderer returned {image.size[0]}x{image.size[1]}, expected {want}x{want}")
+    image = image.convert("RGBA")
+    for dy in range(n):
+        for dx in range(n):
+            left, top = buffer_px + TILE_PX * dx, buffer_px + TILE_PX * dy
+            buf = io.BytesIO()
+            image.crop((left, top, left + TILE_PX, top + TILE_PX)).save(buf, format="PNG")
+            yield dx, dy, buf.getvalue()
+
+
+def fetch_metatile_with_retry(base_url, upstream, z, mx, my, n, buffer_px, timeout):
+    try:
+        return fetch_metatile(base_url, upstream, z, mx, my, n, buffer_px, timeout)
+    except TileError as first:
+        time.sleep(1)
+        try:
+            return fetch_metatile(base_url, upstream, z, mx, my, n, buffer_px, timeout)
+        except TileError:
+            raise first
+
+
 def fetch_with_retry(base_url, upstream, z, x, y, timeout):
     """Transient hiccups (dead FCGI slot, brief timeout) get one immediate retry;
     anything else fails straight into the failure log."""
@@ -428,12 +579,16 @@ class Store:
 # The run itself
 
 
-def iter_tiles(layers, z):
-    """Lazy row-major walk of the 4^z tiles for every layer; never materialised."""
+def iter_blocks(layers, z, n):
+    """Lazy row-major walk of the blocks at one zoom, for every layer; never materialised.
+
+    `n == 1` degenerates to the plain tile walk this replaced.
+    """
+    span = 1 << z
     for layer in layers:
-        for x in range(1 << z):
-            for y in range(1 << z):
-                yield layer, x, y
+        for mx in range(0, span, n):
+            for my in range(0, span, n):
+                yield layer, z, mx, my, n
 
 
 def count_tiles(layers, z):
@@ -488,6 +643,14 @@ def run(argv=None):
     parser.add_argument("--concurrency", type=int, default=4,
                         help="concurrent renders; keep at or below the renderer's FCGID_MAX_PROCESSES")
     parser.add_argument("--timeout", type=float, default=None, help="per-render HTTP timeout in seconds")
+    parser.add_argument("--metatile", default=None,
+                        help="tiles per side per zoom band, e.g. '0-6:2,7-20:4' (default: "
+                             "METATILE_SIZE from .env). Must match what the API uses, or the "
+                             "store and the miss path will disagree. '0-20:1' renders one tile "
+                             "per request, the way this script worked before metatiling.")
+    parser.add_argument("--metatile-buffer", type=int, default=None,
+                        help="pixels rendered around each block and then cropped away "
+                             "(default: METATILE_BUFFER_PX from .env)")
     parser.add_argument("--log-every", type=int, default=250, help="progress line every N tiles")
     parser.add_argument("--max-disk-gb", type=float, default=20,
                         help="pause with a warning when less free space remains")
@@ -525,6 +688,17 @@ def run(argv=None):
         routes = parse_routes(routes_raw)
     except ValueError as exc:
         sys.exit(f"pregenerate: {exc}")
+
+    metatile_raw = args.metatile or env.get("METATILE_SIZE") or DEFAULT_METATILE
+    try:
+        metatile = parse_metatile(metatile_raw)
+    except ValueError as exc:
+        sys.exit(f"pregenerate: {exc}")
+    metatile_buffer = args.metatile_buffer
+    if metatile_buffer is None:
+        metatile_buffer = int(env.get("METATILE_BUFFER_PX") or DEFAULT_METATILE_BUFFER)
+    if metatile_buffer < 0:
+        sys.exit("pregenerate: --metatile-buffer must not be negative")
     layers = (args.layers or ",".join(public_layers(routes, "countries"))).split(",")
     layers = [l.strip() for l in layers if l.strip()]
     for layer in layers:
@@ -543,6 +717,7 @@ def run(argv=None):
     print(f"store:           {out_root}")
     print(f"layers:          {', '.join(layers)}")
     print(f"zoom range:      {args.min_zoom}..{args.max_zoom} ({total:,} tiles)")
+    print(f"metatile:        {metatile_raw} +{metatile_buffer}px buffer")
     print("routes:")
     for public, lo, hi, upstream in routes:
         if public in layers:
@@ -556,14 +731,19 @@ def run(argv=None):
         for z in range(args.min_zoom, args.max_zoom + 1):
             n, secs = estimate_zoom(z, layers, args.tps)
             cum += n
+            edge = metatile_size(metatile, z)
+            renders = len(layers) * ((1 << z) // edge) ** 2
             if args.estimate:
-                print(f"  z{z:<3} {n:>14,} tiles   cum {cum:>14,}   ~{fmt_duration(secs)} alone")
+                print(f"  z{z:<3} {n:>14,} tiles   cum {cum:>14,}   "
+                      f"{renders:>12,} renders ({edge}x{edge})   ~{fmt_duration(secs)} alone")
             else:
-                print(f"  z{z:<3} {n:>14,} tiles")
+                print(f"  z{z:<3} {n:>14,} tiles   {renders:>12,} renders ({edge}x{edge})")
         if args.estimate:
             total_secs = total / args.tps if args.tps else float("inf")
             print(f"  total               ~{fmt_duration(total_secs)} at {args.tps} tiles/s "
                   f"(measured renderer rate ~1-2 tiles/s)")
+            print("  the ETA assumes one render per tile, so with metatiling it is an upper "
+                  "bound:\n  the render column is what actually gets issued.")
         return 0
 
     # From here on we write. Fail fast if the store is not writable (fuseblk mounts are
@@ -585,7 +765,7 @@ def run(argv=None):
             renderer_url, out_root, layers, routes, index, failures_path,
             args.min_zoom, args.max_zoom, args.concurrency, args.timeout or
             float(env.get("RENDER_TIMEOUT_SECS") or 60), args.log_every,
-            args.max_disk_gb, args.retry_failed,
+            args.max_disk_gb, args.retry_failed, metatile, metatile_buffer,
         )
     finally:
         index.close()
@@ -593,30 +773,70 @@ def run(argv=None):
 
 def _execute(renderer_url, out_root, layers, routes, index, failures_path,
              min_zoom, max_zoom, concurrency, timeout, log_every, max_disk_gb,
-             retry_failed):
+             retry_failed, metatile, metatile_buffer):
     store = Store(out_root, index)
 
+    def keep(layer, z, x, y, data, started):
+        """Blank-collapse, dedup and store one tile; shared by both render paths."""
+        sha = hashlib.sha256(data).hexdigest()
+        kind, stored = store.put(layer, z, x, y, data, sha)
+        return {"kind": kind, "layer": layer, "z": z, "x": x, "y": y,
+                "ms": int((time.monotonic() - started) * 1000), "bytes": stored}
+
+    def failed(layer, z, x, y, started, exc):
+        return {"kind": "failed", "layer": layer, "z": z, "x": x, "y": y,
+                "ms": int((time.monotonic() - started) * 1000), "bytes": 0,
+                "error": str(exc)}
+
     def one_tile(layer, z, x, y):
+        """A single tile, rendered on its own. Used wherever METATILE_SIZE leaves a zoom
+        unbanded, and at z0/z1 where a block cannot fit in the pyramid."""
         started = time.monotonic()
         try:
-            target = store.target(layer, z, x, y)
-            if valid_existing(target):
-                return {"kind": "skipped", "layer": layer, "z": z, "x": x, "y": y,
-                        "ms": 0, "bytes": 0}
+            if valid_existing(store.target(layer, z, x, y)):
+                return [{"kind": "skipped", "layer": layer, "z": z, "x": x, "y": y,
+                         "ms": 0, "bytes": 0}]
             upstream = resolve_upstream(routes, layer, z)
             data = fetch_with_retry(renderer_url, upstream, z, x, y, timeout)
-            sha = hashlib.sha256(data).hexdigest()
-            kind, stored = store.put(layer, z, x, y, data, sha)
-            return {"kind": kind, "layer": layer, "z": z, "x": x, "y": y,
-                    "ms": int((time.monotonic() - started) * 1000), "bytes": stored}
+            return [keep(layer, z, x, y, data, started)]
         except TileError as exc:
-            return {"kind": "failed", "layer": layer, "z": z, "x": x, "y": y,
-                    "ms": int((time.monotonic() - started) * 1000), "bytes": 0,
-                    "error": str(exc)}
+            return [failed(layer, z, x, y, started, exc)]
 
-    coords = None
+    def one_block(layer, z, mx, my, n):
+        """A whole n x n block in one render, then sliced. Returns one result per tile."""
+        if n <= 1:
+            return one_tile(layer, z, mx, my)
+
+        started = time.monotonic()
+        coords = [(mx + dx, my + dy) for dy in range(n) for dx in range(n)]
+        # Resume is per block: a partially written block would have to be re-rendered anyway,
+        # and re-slicing the whole thing is free next to the render.
+        if all(valid_existing(store.target(layer, z, x, y)) for x, y in coords):
+            return [{"kind": "skipped", "layer": layer, "z": z, "x": x, "y": y,
+                     "ms": 0, "bytes": 0} for x, y in coords]
+
+        upstream = resolve_upstream(routes, layer, z)
+        try:
+            data = fetch_metatile_with_retry(
+                renderer_url, upstream, z, mx, my, n, metatile_buffer, timeout
+            )
+            sliced = list(slice_metatile(data, n, metatile_buffer))
+        except TileError as exc:
+            # The block is one unit of work, so it fails as one: every tile in it is logged, and
+            # --retry-failed will bring the whole block back.
+            return [failed(layer, z, x, y, started, exc) for x, y in coords]
+
+        # The render cost is one number for the whole block; charging it to the first tile and
+        # nothing to the rest keeps the rate and ETA arithmetic in the progress line honest.
+        results = []
+        for dx, dy, tile in sliced:
+            results.append(keep(layer, z, mx + dx, my + dy, tile, started))
+            started = time.monotonic()
+        return results
+
+    blocks = None
     if retry_failed:
-        coords = []
+        logged = []
         try:
             with open(failures_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -624,38 +844,46 @@ def _execute(renderer_url, out_root, layers, routes, index, failures_path,
                     if not line:
                         continue
                     entry = json.loads(line)
-                    coords.append((entry["layer"], entry["z"], entry["x"], entry["y"]))
+                    logged.append((entry["layer"], entry["z"], entry["x"], entry["y"]))
         except FileNotFoundError:
             pass
-        print(f"retrying {len(coords)} logged failure(s)")
-        if not coords:
+        # A failure is logged per tile but rendered per block, so several logged tiles usually
+        # collapse into one retry. Order-preserving dedup.
+        blocks = list(dict.fromkeys(
+            (layer, z, x - x % (n := metatile_size(metatile, z)), y - y % n, n)
+            for layer, z, x, y in logged
+        ))
+        print(f"retrying {len(logged)} logged failure(s) in {len(blocks)} block(s)")
+        if not blocks:
             return 0
 
     def work_items():
-        if coords is not None:
-            for layer, z, x, y in coords:
-                yield layer, z, x, y
+        if blocks is not None:
+            yield from blocks
             return
         for z in range(min_zoom, max_zoom + 1):
-            for layer, x, y in iter_tiles(layers, z):
-                yield layer, z, x, y
+            yield from iter_blocks(layers, z, metatile_size(metatile, z))
 
     def remaining_items():
-        if coords is not None:
-            return len(coords)
+        if blocks is not None:
+            return sum(n * n for *_, n in blocks)
         return sum(count_tiles(layers, z) for z in range(min_zoom, max_zoom + 1))
 
     counters = {"rendered": 0, "dup": 0, "blank": 0, "skipped": 0, "failed": 0}
     processed = 0
+    logged_at = 0
     ema_ms = 0.0
     last_disk_check = 0.0
     start = time.monotonic()
     retry_failures = []  # still failing, rewritten at the end in retry mode
 
     def log_progress(force=False):
-        nonlocal ema_ms
-        if not force and processed % log_every != 0:
+        # `processed` advances by a whole block at a time now, so it will rarely land exactly on a
+        # multiple of log_every — hence a watermark rather than a modulo.
+        nonlocal ema_ms, logged_at
+        if not force and processed // log_every == logged_at:
             return
+        logged_at = processed // log_every
         elapsed = time.monotonic() - start
         rate = processed / elapsed if elapsed > 0 else 0
         eta_s = (remaining_items() - processed) / rate if rate > 0 else float("inf")
@@ -691,7 +919,7 @@ def _execute(renderer_url, out_root, layers, routes, index, failures_path,
         with failures_lock:
             with open(failures_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({**t, "ts": int(time.time())}) + "\n")
-            if coords is not None:
+            if blocks is not None:
                 retry_failures.append(t)
 
     def bump(kind):
@@ -708,14 +936,17 @@ def _execute(renderer_url, out_root, layers, routes, index, failures_path,
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = pool.map(lambda t: one_tile(*t), work_items())
-            for result in futures:
-                processed += 1
-                if result["ms"] > 0:
-                    ema_ms = ema_ms * 0.95 + result["ms"] * 0.05 if ema_ms else result["ms"]
-                bump(result["kind"])
-                if result["kind"] == "failed":
-                    record_failure(result)
+            futures = pool.map(lambda t: one_block(*t), work_items())
+            # One work item is a block, so it comes back as a list of per-tile results. Everything
+            # downstream — counters, the failure log, the ETA — still counts in tiles.
+            for results in futures:
+                for result in results:
+                    processed += 1
+                    if result["ms"] > 0:
+                        ema_ms = ema_ms * 0.95 + result["ms"] * 0.05 if ema_ms else result["ms"]
+                    bump(result["kind"])
+                    if result["kind"] == "failed":
+                        record_failure(result)
                 check_disk()
                 log_progress()
     except KeyboardInterrupt:
@@ -727,7 +958,7 @@ def _execute(renderer_url, out_root, layers, routes, index, failures_path,
     log_progress(force=True)
     _write_summary(counters, failures_path, start)
 
-    if coords is not None:
+    if blocks is not None:
         tmp = failures_path + ".new"
         with open(tmp, "w", encoding="utf-8") as f:
             for t in retry_failures:
@@ -811,6 +1042,42 @@ def run_self_tests():
             check(f"malformed route rejected: {bad!r}", False)
         except ValueError:
             check(f"malformed route rejected: {bad!r}", True)
+
+    print("metatile bands (mirrors src/config.rs tests):")
+    m = parse_metatile("0-6:2,7-20:4")
+    check("band inclusive at both ends", metatile_size(m, 0) == 1 and metatile_size(m, 6) == 2)
+    check("clamped to the pyramid at z0/z1", metatile_size(m, 1) == 2 and metatile_size(m, 0) == 1)
+    check("second band applies", metatile_size(m, 7) == 4 and metatile_size(m, 20) == 4)
+    check("unbanded zoom renders one tile", metatile_size(m, 21) == 1)
+    check("empty spec disables metatiling", metatile_size(parse_metatile(""), 9) == 1)
+    for bad in ["0-6", "0-6:", "6:2", "6-0:2", "0-99:2", "0-6:3", "0-6:0", "0-6:16", "0-6:two"]:
+        try:
+            parse_metatile(bad)
+            check(f"malformed band rejected: {bad!r}", False)
+        except ValueError:
+            check(f"malformed band rejected: {bad!r}", True)
+
+    print("metatile geometry (mirrors src/metatile.rs tests):")
+    world = metatile_bbox(0, 0, 0, 1, 0)
+    check("z0 unbuffered block is the whole world",
+          all(abs(abs(v) - MERCATOR_HALF_SPAN) < 1e-6 for v in world))
+    top = metatile_bbox(2, 0, 0, 1, 0)
+    bottom = metatile_bbox(2, 0, 3, 1, 0)
+    check("row 0 is the northern edge", abs(top[3] - MERCATOR_HALF_SPAN) < 1e-6
+          and abs(bottom[1] + MERCATOR_HALF_SPAN) < 1e-6 and top[1] > bottom[3])
+    span = 2 * MERCATOR_HALF_SPAN / 8
+    plain, padded = metatile_bbox(3, 4, 4, 2, 0), metatile_bbox(3, 4, 4, 2, TILE_PX)
+    check("a one-tile buffer grows the extent symmetrically",
+          all(abs(padded[i] - (plain[i] - span)) < 1e-6 for i in (0, 1))
+          and all(abs(padded[i] - (plain[i] + span)) < 1e-6 for i in (2, 3)))
+    # A 2x2 block of unbuffered single tiles must tile the same ground as one 2x2 block.
+    block = metatile_bbox(5, 8, 8, 2, 0)
+    corners = [metatile_bbox(5, 8 + dx, 8 + dy, 1, 0) for dx in (0, 1) for dy in (0, 1)]
+    check("a block covers exactly the tiles it contains",
+          abs(min(c[0] for c in corners) - block[0]) < 1e-6
+          and abs(max(c[2] for c in corners) - block[2]) < 1e-6
+          and abs(min(c[1] for c in corners) - block[1]) < 1e-6
+          and abs(max(c[3] for c in corners) - block[3]) < 1e-6)
 
     print("layer-name safety:")
     for good in ["countries", "simple-countries", "dark-basemap_v2.1"]:

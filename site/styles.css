@@ -6,8 +6,8 @@
   --line-strong: rgba(255, 255, 255, 0.14);
   --text: #e8ecf3;
   --muted: #8b94a7;
-  --accent: #7cc4ff;
-  --accent-soft: rgba(124, 196, 255, 0.12);
+  --accent: #ffcccb;
+  --accent-soft: rgba(255, 204, 203, 0.12);
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
   --max: 1080px;
   --radius: 14px;
@@ -70,14 +70,14 @@ a:hover { text-decoration: underline; }
   width: 100%; max-width: var(--max); margin: 0 auto; padding: 26px 24px;
 }
 .brand {
-  display: inline-flex; align-items: center; gap: 10px;
+  display: inline-flex; align-items: center; gap: 12px;
   font-weight: 500; font-size: 0.98rem; letter-spacing: -0.01em; margin: 0;
 }
-.brand-dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 0 4px var(--accent-soft);
-}
+/* Two offset tiles: one zoom level sitting on the next. The three-tile version of the mark mushes
+   below ~32px, so the header and footer use the reduced two-tile lockup. */
+.brand-mark { flex: none; width: 22px; height: 22px; display: block; overflow: visible; }
+.brand-mark .tile-back { fill: var(--accent); }
+.brand-mark .tile-front { fill: var(--bg); stroke: #7c8288; stroke-width: 1.5; }
 .nav-links { display: flex; gap: 26px; flex-wrap: wrap; }
 .nav-links a { color: var(--muted); font-size: 0.9rem; }
 .nav-links a:hover { color: var(--text); text-decoration: none; }

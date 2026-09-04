@@ -6,6 +6,7 @@ use poem::{EndpointExt, Route, Server, get};
 
 mod cache;
 mod config;
+mod metatile;
 mod metrics;
 mod renderer;
 mod routers;
@@ -86,6 +87,8 @@ async fn run() {
         zoom = format!("{}..={}", config.min_zoom, config.max_zoom),
         render_concurrency = config.render_concurrency,
         layer_routes = ?config.layer_routes,
+        metatile = ?config.metatile,
+        metatile_buffer_px = config.metatile_buffer_px,
         "dark-basemap-xyz starting"
     );
 
@@ -173,6 +176,14 @@ mod route_tests {
     }
 
     fn test_state_with_renderer(renderer_url: String, layer_routes: config::LayerRoutes) -> AppState {
+        test_state_full(renderer_url, layer_routes, config::MetatileSizes::default())
+    }
+
+    fn test_state_full(
+        renderer_url: String,
+        layer_routes: config::LayerRoutes,
+        metatile: config::MetatileSizes,
+    ) -> AppState {
         let dir = std::env::temp_dir().join(format!(
             "dark-basemap-routes-{}-{:?}",
             std::process::id(),
@@ -200,6 +211,8 @@ mod route_tests {
             negative_ttl: Duration::from_secs(60),
             project_version: None,
             layer_routes,
+            metatile,
+            metatile_buffer_px: 16,
         });
         let metrics = Arc::new(Metrics::default());
         let cache = Arc::new(TileCache::new(dir, config.tile_ttl));
@@ -295,6 +308,139 @@ mod route_tests {
                 .await;
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// A fake QGIS Server that answers a `GetMap` with a real PNG of the requested size, painting
+    /// each pixel from its position so a mis-cropped slice is detectable. Counts its calls.
+    #[derive(Clone, Default)]
+    struct MapCounter(Arc<std::sync::atomic::AtomicU64>);
+
+    #[poem::handler]
+    async fn fake_qgis_getmap(
+        req: &poem::Request,
+        poem::web::Data(calls): poem::web::Data<&MapCounter>,
+    ) -> poem::Response {
+        calls.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let param = |key: &str| -> u32 {
+            req.uri()
+                .query()
+                .unwrap_or_default()
+                .split('&')
+                .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+        let (width, height) = (param("WIDTH"), param("HEIGHT"));
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([(x / 256) as u8, (y / 256) as u8, 0, 255])
+        });
+        let mut png = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut png),
+            image.as_raw(),
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        poem::Response::builder()
+            .status(poem::http::StatusCode::OK)
+            .header("content-type", "image/png")
+            .body(png)
+    }
+
+    async fn fake_qgis_maps() -> (String, MapCounter, tokio::task::JoinHandle<()>) {
+        use poem::listener::{Acceptor, Listener};
+        let listener = poem::listener::TcpListener::bind("127.0.0.1:0".to_string());
+        let acceptor = listener.into_acceptor().await.unwrap();
+        let local_addrs = acceptor.local_addr();
+        let addr = local_addrs[0].as_socket_addr().unwrap();
+        let calls = MapCounter::default();
+        let app = poem::Route::new()
+            .at("/ows/", poem::get(fake_qgis_getmap))
+            .data(calls.clone());
+        let handle = tokio::spawn(async move {
+            let _ = poem::Server::new_with_acceptor(acceptor)
+                .run_with_graceful_shutdown(app, std::future::pending::<()>(), None)
+                .await;
+        });
+        (format!("http://{addr}"), calls, handle)
+    }
+
+    /// The whole point of metatiling: one request for one tile renders its entire block, writes
+    /// every tile in it, and the fifteen neighbours are then free. Without this the labels on
+    /// those neighbours would each have been placed against their own 256px canvas.
+    #[tokio::test]
+    async fn one_request_renders_the_whole_block_and_the_neighbours_are_free() {
+        let (renderer_url, calls, _server) = fake_qgis_maps().await;
+        let state = test_state_full(
+            renderer_url,
+            config::LayerRoutes::default(),
+            "0-20:4".parse().unwrap(),
+        );
+        let cli = TestClient::new(build_app(state.clone()));
+
+        // z7 x=69 y=45 sits inside the block whose top-left tile is 68/44.
+        cli.get("/tiles/countries/7/69/45.png").send().await.assert_status_is_ok();
+        assert_eq!(calls.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(Metrics::get(&state.metrics.metatile_renders), 1);
+        assert_eq!(Metrics::get(&state.metrics.metatile_tiles), 16);
+
+        let root = state.cache.root().join("countries/7");
+        for x in 68..72 {
+            for y in 44..48 {
+                assert!(root.join(format!("{x}/{y}.png")).exists(), "block tile {x}/{y} not stored");
+            }
+        }
+
+        // Every other tile in the block is now served without touching the renderer...
+        for (x, y) in [(68, 44), (71, 47), (70, 46)] {
+            cli.get(format!("/tiles/countries/7/{x}/{y}.png").as_str())
+                .send()
+                .await
+                .assert_status_is_ok();
+        }
+        assert_eq!(calls.0.load(std::sync::atomic::Ordering::Relaxed), 1, "the block must render once");
+
+        // ...and a tile in the next block over does start a second render.
+        cli.get("/tiles/countries/7/72/44.png").send().await.assert_status_is_ok();
+        assert_eq!(calls.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let _ = std::fs::remove_dir_all(state.cache.root());
+    }
+
+    /// Each stored tile must be the right 256px window of the block, buffer discarded. The fake
+    /// renderer paints the tile index into every pixel, so a swapped axis or a forgotten buffer
+    /// offset shows up as the wrong colour rather than as a subtly shifted map.
+    #[tokio::test]
+    async fn sliced_tiles_land_on_the_right_coordinates() {
+        let (renderer_url, _calls, _server) = fake_qgis_maps().await;
+        let state = test_state_full(
+            renderer_url,
+            config::LayerRoutes::default(),
+            "0-20:2".parse().unwrap(),
+        );
+        let cli = TestClient::new(build_app(state.clone()));
+        cli.get("/tiles/countries/9/270/174.png").send().await.assert_status_is_ok();
+
+        // The fake paints each pixel `(x / 256, y / 256)` of the *block* image, which for a 16px
+        // buffer means tile (dx, dy) is cut from x in [16 + 256*dx, 272 + 256*dx).
+        for (dx, dy) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+            let path = state.cache.root().join(format!("countries/9/{}/{}.png", 270 + dx, 174 + dy));
+            let tile = image::load_from_memory(&std::fs::read(&path).unwrap()).unwrap().into_rgba8();
+            assert_eq!(tile.dimensions(), (256, 256));
+            // Top-left pins the column and row this tile was cut from...
+            assert_eq!(*tile.get_pixel(0, 0), image::Rgba([dx as u8, dy as u8, 0, 255]), "{path:?}");
+            // ...and bottom-left pins the buffer: 16 + 256*dx + 255 crosses into the next 256px
+            // band, which it would not if the crop had started at the image edge.
+            assert_eq!(
+                *tile.get_pixel(255, 255),
+                image::Rgba([dx as u8 + 1, dy as u8 + 1, 0, 255]),
+                "{path:?} was cropped without the buffer offset"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(state.cache.root());
     }
 
     /// Guards the split between the two failure classes: a tile the renderer *answered* badly is
