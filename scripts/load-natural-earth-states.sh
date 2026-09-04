@@ -64,4 +64,5 @@ idx=$(PGPASSWORD="$DB_PASSWORD" psql -qtAX -h "$DB_HOST" -p "$DB_PORT" -U "$DB_U
 
 log "public.$TABLE: $n rows, spatial index ok"
 echo
+echo "if needed: scripts/load-natural-earth-ocean.sh"
 echo "next: python3 scripts/patch-project.py --base --detail"

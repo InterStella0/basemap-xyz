@@ -6,16 +6,16 @@ reviewable diff. This script is the reviewable source of truth for the cartograp
 idempotent, so re-running it after a QGIS Desktop edit re-applies the same intent.
 
 Two phases, because the detail layers cannot exist before their data does — QGIS Server runs with
-QGIS_SERVER_IGNORE_BAD_LAYERS=0, so a layer pointing at a missing GeoPackage takes down the whole
+QGIS_SERVER_IGNORE_BAD_LAYERS=0, so a layer pointing at a missing source takes down the whole
 project, not just that layer.
 
-  --base     (always safe) rename `countries` -> `simple-countries`, put country labels on it so
-             the z0-3 route is not a silent map, and extend the WMTS pyramid from z0-16 to z0-20 so
-             MAX_ZOOM=20 in .env is actually served.
-  --detail   add the OSM detail layers, the Natural Earth state boundaries and every label layer as
-             a group published under the single WMTS name `countries`. Requires the GeoPackages from
-             scripts/build-osm-detail.sh and the PostGIS tables from
-             scripts/load-natural-earth-states.sh to exist.
+  --base     replace the old standalone country layer with a `simple-countries` group containing
+             Natural Earth land, ocean and low-zoom labels, and extend the WMTS pyramid from z0-16
+             to z0-20 so MAX_ZOOM=20 in .env is actually served.
+  --detail   add the OSM detail layers, Natural Earth land/ocean and every label layer as a group
+             published under the single WMTS name `countries`. Requires the GeoPackages from
+             scripts/build-osm-detail.sh and the PostGIS tables loaded by the two
+             scripts/load-natural-earth-*.sh helpers.
 
 Run scripts/sync-project-version.sh afterwards to flush the tile cache.
 """
@@ -488,15 +488,15 @@ def labeling(spec: dict, geometry: str) -> ET.Element:
 
 
 # --- the detail themes ----------------------------------------------------------------------------
-# Colours extend the established theme: land #0f0f0f on a black canvas with a white border. Water
-# reads as a hole punched in the land, landuse as a barely-there lift, buildings one step above land,
-# roads the only bright thing, and label text the one thing brighter still. min_z is the XYZ zoom the
-# layer starts drawing at; below it QGIS does not even query the GeoPackage, which is the entire
-# point of the exercise.
+# Colours extend the established theme: ocean and inland water #07090c, land #0f0f0f with a white
+# border, landuse as a barely-there lift, buildings one step above land, roads the only bright thing,
+# and label text the one thing brighter still. min_z is the XYZ zoom the layer starts drawing at;
+# below it QGIS does not even query the source, which is the entire point of the exercise.
 #
 # Order is draw order, top first: label-only layers, then boundaries, then roads, then the fills, and
-# `land-base` at the bottom holding everything up. Labels are placed in a pass of their own after all
-# geometry, so their position here decides which name wins a collision, not what is drawn over what.
+# `land-base` above `ocean-base` at the bottom holding everything up. Labels are placed in a pass of
+# their own after all geometry, so their position here decides which name wins a collision, not what
+# is drawn over what.
 #
 # A theme is label-only when its renderer is `invisible_renderer` — QGIS will not load a vector layer
 # without a renderer, so a layer that exists purely to carry text still has to declare one that draws
@@ -524,6 +524,98 @@ STATE_LABEL = {
     "priority": 6,
     "min_feature_mm": 8,
 }
+
+OCEAN_LABEL = {
+    "field": 'coalesce("name_en", "name")',
+    "colour": "#5d7285",
+    "size": 9,
+    "italic": True,
+    "capitalization": 1,
+    "letter_spacing": 1.2,
+    "halo_size": 0.8,
+    "priority": 4,
+}
+
+MARINE_LABEL = {
+    "field": 'coalesce("name_en", "name")',
+    "colour": "#5d7285",
+    "size": 8,
+    "italic": True,
+    "halo_size": 0.7,
+    "priority": 4,
+    "min_feature_mm": 5,
+}
+
+
+def marine_label_themes(prefix: str = "") -> list[dict]:
+    """Natural Earth's useful low-zoom marine-label bands.
+
+    Its rank metadata brings the seven oceans in at z1, major seas and bays at z2, and regional
+    features at z4/z5. Ranks 4+ are deliberately left to OSM's `water-labels`, which starts at z6;
+    carrying all 306 Natural Earth areas farther in would print the same bays from both sources.
+    """
+    return [
+        {
+            "name": f"{prefix}ocean-labels",
+            "pg_table": "marine_areas",
+            "geometry": "Polygon",
+            "wkb": "MultiPolygon",
+            "subset": '"featurecla" = \'ocean\'',
+            "min_z": 1,
+            "max_z": 6,
+            "renderer": lambda: invisible_renderer("fill"),
+            "label": OCEAN_LABEL,
+        },
+        {
+            "name": f"{prefix}marine-labels-major",
+            "pg_table": "marine_areas",
+            "geometry": "Polygon",
+            "wkb": "MultiPolygon",
+            "subset": '"scalerank" = 1',
+            "min_z": 2,
+            "max_z": 5,
+            "renderer": lambda: invisible_renderer("fill"),
+            "label": MARINE_LABEL,
+        },
+        {
+            "name": f"{prefix}marine-labels-regional",
+            "pg_table": "marine_areas",
+            "geometry": "Polygon",
+            "wkb": "MultiPolygon",
+            "subset": '"scalerank" = 2',
+            "min_z": 4,
+            "max_z": 5,
+            "renderer": lambda: invisible_renderer("fill"),
+            "label": MARINE_LABEL,
+        },
+        {
+            "name": f"{prefix}marine-labels-local",
+            "pg_table": "marine_areas",
+            "geometry": "Polygon",
+            "wkb": "MultiPolygon",
+            "subset": '"scalerank" = 3',
+            "min_z": 5,
+            "max_z": 5,
+            "renderer": lambda: invisible_renderer("fill"),
+            "label": MARINE_LABEL,
+        },
+    ]
+
+
+def ocean_base_theme(name: str) -> dict:
+    return {
+        "name": name,
+        "pg_table": "ocean",
+        "geometry": "Polygon",
+        "wkb": "Polygon",
+        "min_z": None,
+        # The same-colour hairline overlaps the internal ST_Subdivide cuts. With no outline,
+        # antialiasing can turn those shared edges into faint transparent seams.
+        "renderer": lambda: single_renderer(
+            symbol("fill", "0", [fill_layer("#07090c", "#07090c", 0.1)])
+        ),
+    }
+
 
 def city_band(lo: int | None = None, hi: int | None = None) -> str:
     """A `place=city` subset for one population band, half-open: `lo <= population < hi`.
@@ -685,6 +777,7 @@ THEMES = [
             "min_feature_mm": 5,
         },
     },
+    *marine_label_themes(),
     {
         "name": "states",
         "pg_table": "states",
@@ -782,6 +875,34 @@ THEMES = [
             symbol("fill", "0", [fill_layer("#0f0f0f", "#ffffff", 0.26)])
         ),
     },
+    ocean_base_theme("ocean-base"),
+]
+
+# The cheap route is a group too: ocean and marine labels cannot accompany a standalone WMTS
+# layer. Its land and country-label layers intentionally use the same source and symbols as the
+# detail group, so z3 -> z4 changes detail rather than changing the basemap underneath it.
+SIMPLE_THEMES = [
+    {
+        "name": "simple-country-labels",
+        "pg_table": "countries",
+        "geometry": "Polygon",
+        "wkb": "MultiPolygon",
+        "min_z": None,
+        "renderer": lambda: invisible_renderer("fill"),
+        "label": COUNTRY_LABEL,
+    },
+    *marine_label_themes("simple-"),
+    {
+        "name": "simple-land-base",
+        "pg_table": "countries",
+        "geometry": "Polygon",
+        "wkb": "MultiPolygon",
+        "min_z": None,
+        "renderer": lambda: single_renderer(
+            symbol("fill", "0", [fill_layer("#0f0f0f", "#ffffff", 0.26)])
+        ),
+    },
+    ocean_base_theme("simple-ocean-base"),
 ]
 
 WGS84_WKT = (
@@ -971,31 +1092,155 @@ def set_prop_values(root: ET.Element, name: str, values: list[str]) -> None:
         ET.SubElement(el, "value").text = v
 
 
-def rename_layer(root: ET.Element, old: str, new: str) -> bool:
-    """Rename by display name in all three places QGIS keeps it. The layer *id* is left alone, so
-    WMTSLayers/Layer (which holds ids) keeps pointing at the right layer."""
-    changed = False
-    for el in root.iter("layer-tree-layer"):
-        if el.get("name") == old:
-            el.set("name", new)
-            changed = True
-    for el in root.iter("legendlayer"):
-        if el.get("name") == old:
-            el.set("name", new)
-            changed = True
-    for ml in root.iter("maplayer"):
-        ln = ml.find("layername")
-        if ln is not None and ln.text == old:
-            ln.text = new
-            changed = True
-    return changed
+def prop_values(root: ET.Element, name: str) -> list[str]:
+    el = prop(root, name)
+    if el is None:
+        raise SystemExit(f"patch-project: property {name!r} not found in project.qgs")
+    return [v.text or "" for v in el.findall("value")]
 
 
-def patch_base(root: ET.Element) -> None:
-    if rename_layer(root, "countries", "simple-countries"):
-        print("  renamed layer 'countries' -> 'simple-countries'")
-    else:
-        print("  layer already named 'simple-countries'")
+def add_prop_value(root: ET.Element, name: str, value: str) -> None:
+    values = prop_values(root, name)
+    if value not in values:
+        values.append(value)
+        set_prop_values(root, name, values)
+
+
+def remove_prop_values(root: ET.Element, name: str, removed: set[str]) -> None:
+    set_prop_values(root, name, [v for v in prop_values(root, name) if v not in removed])
+
+
+def replace_group(
+    root: ET.Element,
+    group_name: str,
+    themes: list[dict],
+    *,
+    legacy_layer_names: set[str] | None = None,
+) -> None:
+    """Replace one managed group without disturbing unrelated project layers.
+
+    Earlier code deleted every maplayer not referenced after removing `countries`. That happened to
+    work while the project contained only one other layer, but it is unsafe now that both published
+    products are groups. Track the ids owned by the group (and the old standalone low-zoom layer)
+    explicitly, then remove only those ids from every parallel QGIS structure.
+    """
+    tree = root.find("layer-tree-group")
+    legend = root.find("legend")
+    layers = root.find("projectlayers")
+    order = root.find("layerorder")
+    if tree is None or legend is None or layers is None:
+        raise SystemExit("patch-project: project.qgs is missing layer-tree-group/legend/projectlayers")
+
+    removed_ids: set[str] = set()
+    for grp in list(tree.findall("layer-tree-group")):
+        if grp.get("name") == group_name:
+            removed_ids.update(
+                el.get("id") for el in grp.iter("layer-tree-layer") if el.get("id")
+            )
+            tree.remove(grp)
+    for grp in list(legend.findall("legendgroup")):
+        if grp.get("name") == group_name:
+            legend.remove(grp)
+
+    legacy_layer_names = legacy_layer_names or set()
+    for el in list(tree.findall("layer-tree-layer")):
+        if el.get("name") in legacy_layer_names:
+            if el.get("id"):
+                removed_ids.add(el.get("id"))
+            tree.remove(el)
+    for el in list(legend.findall("legendlayer")):
+        if el.get("name") in legacy_layer_names:
+            legend.remove(el)
+
+    for ml in list(layers.findall("maplayer")):
+        id_el = ml.find("id")
+        if id_el is not None and id_el.text in removed_ids:
+            layers.remove(ml)
+    if order is not None:
+        for item in list(order.findall("layer")):
+            if item.get("id") in removed_ids:
+                order.remove(item)
+    custom_order = tree.find("custom-order")
+    if custom_order is not None:
+        for item in list(custom_order.findall("item")):
+            if item.text in removed_ids:
+                custom_order.remove(item)
+
+    # A standalone layer is published by id, while a group is published by name. Remove the
+    # obsolete ids and retain any unrelated WMTS publications the user may have added by hand.
+    for path in ("WMTSLayers/Layer", "WMTSPngLayers/Layer"):
+        remove_prop_values(root, path, removed_ids)
+
+    group = ET.Element(
+        "layer-tree-group",
+        {"checked": "Qt::Checked", "expanded": "1", "groupLayer": "", "name": group_name},
+    )
+    legend_group = ET.Element(
+        "legendgroup", {"checked": "Qt::Checked", "name": group_name, "open": "true"}
+    )
+
+    for theme in themes:
+        layer_id = "{}_{}".format(theme["name"].replace("-", "_"), uuid.uuid4().hex)
+        ET.SubElement(
+            group,
+            "layer-tree-layer",
+            {
+                "checked": "Qt::Checked",
+                "expanded": "0",
+                "id": layer_id,
+                "legend_exp": "",
+                "legend_split_behavior": "0",
+                "name": theme["name"],
+                "patch_size": "-1,-1",
+                "providerKey": theme_provider(theme),
+                "source": theme_datasource(theme),
+            },
+        ).append(ET.Element("customproperties"))
+        lg = ET.SubElement(
+            legend_group,
+            "legendlayer",
+            {
+                "checked": "Qt::Checked",
+                "drawingOrder": "-1",
+                "name": theme["name"],
+                "open": "false",
+                "showFeatureCount": "0",
+            },
+        )
+        ET.SubElement(
+            ET.SubElement(lg, "filegroup", {"hidden": "false", "open": "false"}),
+            "legendlayerfile",
+            {"isInOverview": "0", "layerid": layer_id, "visible": "1"},
+        )
+        layers.append(make_maplayer(theme, layer_id))
+        if order is not None:
+            order.append(ET.Element("layer", {"id": layer_id}))
+        if custom_order is not None:
+            ET.SubElement(custom_order, "item").text = layer_id
+
+    # Top-level tree order is presentation order; the public routes ensure the two basemap groups
+    # are never drawn together.
+    tree.insert(0, group)
+    legend.insert(0, legend_group)
+    for path in ("WMTSLayers/Group", "WMTSPngLayers/Group"):
+        add_prop_value(root, path, group_name)
+
+    print(
+        f"  added group {group_name!r} with {len(themes)} layers: "
+        + ", ".join(t["name"] for t in themes)
+    )
+    print(f"  published group {group_name!r} for WMTS (png)")
+
+
+def patch_base(root: ET.Element, require_data: bool) -> None:
+    check_pg_tables(SIMPLE_THEMES, require_data)
+
+    replace_group(
+        root,
+        "simple-countries",
+        SIMPLE_THEMES,
+        legacy_layer_names={"countries", "simple-countries"},
+    )
 
     # The pyramid. Config is '<CRS>,<xmin>,<ymin>,<z0 scale>,<levels>'; the trailing level count is
     # what truncated the matrix set at z17, and WMTSMinScale=5004 cut it again to z16.
@@ -1015,24 +1260,6 @@ def patch_base(root: ET.Element) -> None:
     if min_scale is not None and min_scale.text != "0":
         print(f"  WMTSMinScale {min_scale.text} -> 0 (was truncating the pyramid at z16)")
         min_scale.text = "0"
-
-    # Country names on `simple-countries` itself. That layer is not part of the detail group, and
-    # TILE_LAYER_ROUTES sends z0-3 to it, so without this the world has no names at all until the
-    # detail layers take over at z4. It reads the same Natural Earth table as `country-labels`, so
-    # the names do not change as you cross the switch — the point of using Natural Earth for text at
-    # every zoom and letting OSM add places on top, rather than treating it as a fallback.
-    for ml in root.iter("maplayer"):
-        ln = ml.find("layername")
-        if ln is None or ln.text != "simple-countries":
-            continue
-        for old_lab in list(ml.findall("labeling")):
-            ml.remove(old_lab)
-        ml.set("labelsEnabled", "1")
-        # After <renderer-v2>, which is where QGIS itself writes it.
-        renderer = ml.find("renderer-v2")
-        index = list(ml).index(renderer) + 1 if renderer is not None else len(ml)
-        ml.insert(index, labeling(COUNTRY_LABEL, "Polygon"))
-        print("  labelled 'simple-countries' with country names")
 
 
 def missing_pg_tables(themes: list[dict]) -> set[str] | None:
@@ -1070,6 +1297,22 @@ def missing_pg_tables(themes: list[dict]) -> set[str] | None:
     return wanted - set(out.stdout.split())
 
 
+def check_pg_tables(themes: list[dict], require_data: bool) -> None:
+    """Fail before writing a strict QGIS project that references absent PostGIS tables."""
+    missing = missing_pg_tables(themes)
+    if missing is None:
+        print("  NOTE: could not reach PostgreSQL to verify the Natural Earth tables exist")
+    elif missing and require_data:
+        raise SystemExit(
+            "patch-project: missing PostGIS table(s): " + ", ".join(sorted(missing)) + ".\n"
+            "  Run scripts/load-natural-earth-ocean.sh and/or "
+            "scripts/load-natural-earth-states.sh first, or pass --allow-missing-data to "
+            "write the project anyway."
+        )
+    elif missing:
+        print(f"  WARNING: referencing absent PostGIS table(s): {', '.join(sorted(missing))}")
+
+
 def patch_detail(root: ET.Element, data_dir: Path, require_data: bool) -> None:
     # Only reference GeoPackages that actually exist. QGIS Server runs with
     # QGIS_SERVER_IGNORE_BAD_LAYERS=0, so a layer pointing at a missing file fails the entire
@@ -1094,116 +1337,16 @@ def patch_detail(root: ET.Element, data_dir: Path, require_data: bool) -> None:
         present = list(THEMES)
     themes = present
 
-    # A PostGIS layer pointing at a table that does not exist takes down the whole project under
-    # QGIS_SERVER_IGNORE_BAD_LAYERS=0, and it does it at load time — every tile 500s, with the
-    # reason only in the renderer's log. Cheaper to refuse to write the file.
-    missing = missing_pg_tables(themes)
-    if missing is None:
-        print("  NOTE: could not reach PostgreSQL to verify the Natural Earth tables exist")
-    elif missing and require_data:
-        raise SystemExit(
-            "patch-project: missing PostGIS table(s): " + ", ".join(sorted(missing)) + ".\n"
-            "  Run scripts/load-natural-earth-states.sh first, or pass --allow-missing-data to "
-            "write the project anyway."
-        )
-    elif missing:
-        print(f"  WARNING: referencing absent PostGIS table(s): {', '.join(sorted(missing))}")
-
-    tree = root.find("layer-tree-group")
-    legend = root.find("legend")
-    layers = root.find("projectlayers")
-    order = root.find("layerorder")
-    if tree is None or legend is None or layers is None:
-        raise SystemExit("patch-project: project.qgs is missing layer-tree-group/legend/projectlayers")
-
-    # Idempotence: drop any previous run's group and layers before re-adding.
-    for grp in list(tree.findall("layer-tree-group")):
-        if grp.get("name") == "countries":
-            tree.remove(grp)
-    for grp in list(legend.findall("legendgroup")):
-        if grp.get("name") == "countries":
-            legend.remove(grp)
-    # Anything the layer tree no longer references. Matching on the current THEMES names is not
-    # enough: a theme that gets renamed (`countries-detail` did, in an earlier pass) leaves a
-    # maplayer behind that no name in the list matches, and it survives every subsequent run. The
-    # tree is the authority — `simple-countries` is the only layer outside the group we build here.
-    keep_ids = {
-        el.get("id") for el in tree.iter("layer-tree-layer") if el.get("id")
-    }
-    for ml in list(layers.findall("maplayer")):
-        id_el = ml.find("id")
-        if id_el is not None and id_el.text not in keep_ids:
-            layers.remove(ml)
-    if order is not None:
-        for item in list(order.findall("layer")):
-            if item.get("id") not in keep_ids:
-                order.remove(item)
-
-    group = ET.Element(
-        "layer-tree-group",
-        {"checked": "Qt::Checked", "expanded": "1", "groupLayer": "", "name": "countries"},
-    )
-    legend_group = ET.Element(
-        "legendgroup", {"checked": "Qt::Checked", "name": "countries", "open": "true"}
-    )
-
-    for theme in themes:
-        layer_id = "{}_{}".format(theme["name"].replace("-", "_"), uuid.uuid4().hex)
-        # Same source and provider the maplayer gets. These were hardcoded to ogr and a /data path,
-        # which made the tree entry for every PostGIS theme a lie — harmless, because QGIS Server
-        # reads the maplayer, but it means the project opened in QGIS Desktop disagreed with itself.
-        ET.SubElement(
-            group,
-            "layer-tree-layer",
-            {
-                "checked": "Qt::Checked",
-                "expanded": "0",
-                "id": layer_id,
-                "legend_exp": "",
-                "legend_split_behavior": "0",
-                "name": theme["name"],
-                "patch_size": "-1,-1",
-                "providerKey": theme_provider(theme),
-                "source": theme_datasource(theme),
-            },
-        ).append(ET.Element("customproperties"))
-        lg = ET.SubElement(
-            legend_group,
-            "legendlayer",
-            {
-                "checked": "Qt::Checked",
-                "drawingOrder": "-1",
-                "name": theme["name"],
-                "open": "false",
-                "showFeatureCount": "0",
-            },
-        )
-        ET.SubElement(ET.SubElement(lg, "filegroup", {"hidden": "false", "open": "false"}),
-                      "legendlayerfile",
-                      {"isInOverview": "0", "layerid": layer_id, "visible": "1"})
-        layers.append(make_maplayer(theme, layer_id))
-        if order is not None:
-            order.append(ET.Element("layer", {"id": layer_id}))
-
-    # Insert above the existing simple-countries entry so the detail group draws on top of nothing —
-    # the two are never visible at the same zoom anyway, but tree order decides group nesting.
-    tree.insert(0, group)
-    legend.insert(0, legend_group)
-    print(f"  added group 'countries' with {len(themes)} layers: " + ", ".join(t["name"] for t in themes))
-
-    # Publish the group as one WMTS layer. WMTSLayers/Layer holds layer *ids*; the Group key holds
-    # group *names*. Publishing the group is what lets five styled layers answer to one name.
-    set_prop_values(root, "WMTSLayers/Group", ["countries"])
-    set_prop_values(root, "WMTSPngLayers/Group", ["countries"])
-    print("  published group 'countries' for WMTS (png)")
+    check_pg_tables(themes, require_data)
+    replace_group(root, "countries", themes)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base", action="store_true", help="rename the layer and fix the WMTS pyramid depth")
+    ap.add_argument("--base", action="store_true", help="build the Natural Earth low-zoom group and fix the WMTS pyramid depth")
     ap.add_argument("--detail", action="store_true", help="add the OSM detail layer group")
     ap.add_argument("--data-dir", default="/mnt/meow/OSM/out", help="where the GeoPackages live on the host")
-    ap.add_argument("--allow-missing-data", action="store_true", help="patch --detail even if the GeoPackages are absent")
+    ap.add_argument("--allow-missing-data", action="store_true", help="write layers even when their PostGIS tables or GeoPackages are absent")
     ap.add_argument("--project", default=str(PROJECT))
     args = ap.parse_args()
 
@@ -1225,7 +1368,7 @@ def main() -> int:
 
     if args.base:
         print("--base:")
-        patch_base(root)
+        patch_base(root, not args.allow_missing_data)
     if args.detail:
         print("--detail:")
         patch_detail(root, Path(args.data_dir), not args.allow_missing_data)

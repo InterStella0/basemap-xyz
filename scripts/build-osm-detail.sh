@@ -263,6 +263,7 @@ Staging file $(basename "$STAGE") is kept so the themes can be re-split with dif
 cheaply (rerun with SKIP_DERIVE= to redo just the split). Delete it to reclaim the space.
 
 Next:
+  scripts/load-natural-earth-ocean.sh         # if public.ocean/marine_areas do not exist yet
   scripts/load-natural-earth-states.sh        # if public.states does not exist yet
   python3 scripts/patch-project.py --base --detail
   edit .env: TILE_LAYER_ROUTES=countries@0-3=simple-countries
