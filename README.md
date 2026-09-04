@@ -1,5 +1,11 @@
 # basemap-xyz
 
+
+![Code Size](https://img.shields.io/github/languages/code-size/InterStella0/basemap-xyz?style=flat)
+![Rust](https://tokei.queeniemella.cc/b1/github/InterStella0/basemap-xyz?style=flat&category=code&label=Rust&type=Rust)
+![JavaScript](https://tokei.queeniemella.cc/b1/github/InterStella0/basemap-xyz?style=flat&category=code&label=Python&type=Python)
+![Total line of code](https://tokei.queeniemella.cc/b1/github/InterStella0/basemap-xyz?style=flat&category=code&label=Total)
+
 A free, no-API-key dark basemap. OpenStreetMap data with custom QGIS symbology, rendered by QGIS
 Server and served as plain XYZ tiles.
 
